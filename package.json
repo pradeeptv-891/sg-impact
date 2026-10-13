@@ -1,0 +1,21 @@
+{
+  "name": "impact-einvoicing-addon",
+  "private": true,
+  "type": "module",
+  "description": "Storeganise add-on: issues every Storeganise invoice as a Greek myDATA e-invoice via IMPACT INVOICING",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch --env-file=.env server.js",
+    "test": "NODE_ENV=test node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
+  }
+}
