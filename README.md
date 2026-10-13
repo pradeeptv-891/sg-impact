@@ -177,6 +177,28 @@ npm run dev
 npm test                # runs on an in-memory Postgres (PGlite) with the real migrations
 ```
 
+### Dry run against real Storeganise data
+
+Before go-live, or after onboarding a company, run the add-on's own fetch code against
+the real Storeganise account. It is read-only: GET requests only (every write-back is
+blocked and counted), Impact is never called, and it runs on a throwaway in-memory
+database, not Supabase.
+
+```bash
+export SG_API_URL=https://<business>.storeganise.com/api
+export SG_API_KEY=<admin api key>        # paste into the shell; never commit it
+
+npm run probe                            # invoices updated in the last 24h: poll + worker decisions
+npm run probe -- --since 7d              # a wider window (also accepts an ISO date)
+npm run probe -- --invoice <id>          # one invoice, as a payment webhook would handle it
+npm run probe -- --invoice <id> --payload  # ...plus the Impact document it would send
+```
+
+It reports which invoices would be sent (`pending`), held for customer data, or
+skipped, and what the list endpoint really returns: which fields are present, whether
+pages overlap, and the order invoices come back in. `--max-pages` (default 5) caps
+the listing.
+
 ## Operator runbook (Supabase SQL editor)
 
 | Need | SQL |

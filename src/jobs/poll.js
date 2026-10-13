@@ -1,7 +1,9 @@
+import { audit } from '../audit.js';
 import { pollAccounts, storeganiseFor } from '../companies.js';
 import { normalizeInvoice } from '../mydata/normalize.js';
 import { isFullyPaid } from '../mydata/rules.js';
 import { getState, loadConfig, setState } from '../settings.js';
+import { clampUpdatedAfter } from '../storeganise-api.js';
 import { queuePaidInvoice } from './capture.js';
 import * as repo from './repo.js';
 
@@ -48,7 +50,17 @@ async function pollAccount(cfg, { owner, companies }, sg) {
   const cursor = await getState(cursorKey);
   // First ever run looks back a day; go-live back-filling is out of scope (FRD 1.2)
   const since = cursor ? new Date(cursor) : new Date(startedAt.getTime() - 24 * 3600 * 1000);
-  const updatedAfter = new Date(since.getTime() - overlapMs).toISOString();
+  // Storeganise refuses updatedAfter > 40 days back. After an outage that long the
+  // gap is left to the reconciliation and an operator; record it so it is seen.
+  const wanted = new Date(since.getTime() - overlapMs);
+  const from = clampUpdatedAfter(wanted);
+  const updatedAfter = from.toISOString();
+  if (from > wanted) {
+    await audit({
+      kind: 'system', companyId: owner.id, method: 'poll',
+      error: `Poll gap: invoices updated between ${wanted.toISOString()} and ${updatedAfter} are older than Storeganise's 40-day updatedAfter limit and were not polled`,
+    });
+  }
 
   let offset = 0;
   let seen = 0;
@@ -88,5 +100,5 @@ async function pollAccount(cfg, { owner, companies }, sg) {
   }
 
   await setState(cursorKey, startedAt.toISOString());
-  return { updatedAfter, seen, queued, ...(unmapped && { unmappedSite: unmapped }) };
+  return { updatedAfter, seen, queued, ...(unmapped && { unmappedSite: unmapped }), ...(from > wanted && { gapBefore: updatedAfter }) };
 }

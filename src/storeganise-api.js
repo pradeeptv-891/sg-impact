@@ -23,6 +23,15 @@ import { loadConfig } from './settings.js';
  * Use companies.storeganiseFor() so a company always gets the same client.
  */
 
+// Storeganise: "updatedAfter cannot be more than 40 days in the past" (400)
+export const UPDATED_AFTER_MAX_DAYS = 40;
+
+/** The earliest `updatedAfter` Storeganise accepts, with a day's margin. */
+export function clampUpdatedAfter(date) {
+  const earliest = Date.now() - (UPDATED_AFTER_MAX_DAYS - 1) * 86400000;
+  return new Date(Math.max(date.getTime(), earliest));
+}
+
 export class StoreganiseError extends Error {
   constructor(message, { status, permanent }) {
     super(message);
@@ -130,12 +139,13 @@ export default function storeganiseApi({ company = null, apiUrl, apiKey, timeout
     put: (path, body) => call(path, { method: 'PUT', body }),
 
     /**
-     * Full invoice with its customer and payments (a single-entity read, where
-     * Storeganise recommends `include`). Returns null if it was deleted.
+     * Full invoice with its lines, customer and payments (a single-entity read,
+     * where Storeganise recommends `include`). Returns null if it was deleted.
+     * The lines (`entries`) are only returned when included.
      */
     async getInvoice(invoiceId, { deadline } = {}) {
       try {
-        return await call(`/v1/admin/invoices/${encodeURIComponent(invoiceId)}?include=owner,payments,customFields`, { deadline });
+        return await call(`/v1/admin/invoices/${encodeURIComponent(invoiceId)}?include=entries,owner,payments,customFields`, { deadline });
       } catch (err) {
         if (err.status === 404) return null;
         throw err;
@@ -146,7 +156,11 @@ export default function storeganiseApi({ company = null, apiUrl, apiKey, timeout
       return call(`/v1/admin/users/${encodeURIComponent(userId)}?include=customFields`);
     },
 
-    /** One page of invoices changed since `updatedAfter` (FR-CAP-04). */
+    /**
+     * One page of invoices changed since `updatedAfter` (FR-CAP-04), newest
+     * update first. Storeganise refuses an `updatedAfter` more than 40 days back;
+     * callers clamp with clampUpdatedAfter().
+     */
     async listInvoices({ updatedAfter, limit = 100, offset = 0 }) {
       const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
       if (updatedAfter) params.set('updatedAfter', updatedAfter);

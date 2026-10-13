@@ -5,6 +5,7 @@ import { toCents } from '../mydata/money.js';
 import { normalizeInvoice } from '../mydata/normalize.js';
 import { isFullyPaid } from '../mydata/rules.js';
 import { loadConfig } from '../settings.js';
+import { clampUpdatedAfter } from '../storeganise-api.js';
 import { queuePaidInvoice } from './capture.js';
 import * as repo from './repo.js';
 
@@ -41,7 +42,7 @@ export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganis
     let paidCount = 0;
 
     for (const { owner, companies } of pollAccounts(cfg)) {
-      const sgInvoices = await listAll(sgFor(owner), windowFrom.toISOString(), Number(settings.poll_page_size) || 100);
+      const sgInvoices = await listAll(sgFor(owner), clampUpdatedAfter(windowFrom).toISOString(), Number(settings.poll_page_size) || 100);
       const paid = sgInvoices.filter(i => isFullyPaid(normalizeInvoice(i, settings), settings));
       sgInvoiceCount += sgInvoices.length;
       paidCount += paid.length;

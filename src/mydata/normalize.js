@@ -13,11 +13,13 @@ import { roundCents, toCents } from './money.js';
  *   invoice  id, sid, state, type, siteId, unitRentalId, sent, paid, failed,
  *            startDate, endDate, subtotal, tax, taxPercent (may be null), total,
  *            amountPaid, balance, creditApplied, meta, owner, payments, entries
- *   entries  the invoice lines: { id, desc, code, type, date, endDate, tags,
+ *   entries  the invoice lines of unit invoices, returned only with
+ *            include=entries: { id, desc, code, type, date, endDate, tags,
  *            amount (unit price), qty, subtotal (net), taxPct, tax (VAT), total }
+ *   items    the invoice lines of valet invoices (type "valet"), which come back
+ *            with an empty `entries`: { id, desc, quantity, price, total, startDate }
  *   payments { id, created, type, amount, date, method }
- * `items` on an invoice is NOT the invoice lines (it is valet storage items) and
- * is only used when `entries` is absent.
+ * Checked against dev-qodic.storeganise.com on 2026-10-13.
  */
 export function normalizeInvoice(raw, settings = {}) {
   const discountTypes = new Set((settings.sg_discount_line_types || []).map(lower));
@@ -25,7 +27,9 @@ export function normalizeInvoice(raw, settings = {}) {
   const pricesIncludeTax = settings.prices_include_tax === true;
   const invoiceRate = percent(raw.taxPercent ?? raw.taxRate);
 
-  const source = Array.isArray(raw.entries) ? raw.entries : raw.lines || raw.items || [];
+  const entries = Array.isArray(raw.entries) ? raw.entries : [];
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  const source = entries.length ? entries : items.length ? items : raw.lines || [];
 
   const lines = source.map((entry, index) => {
     const quantity = Number(entry.qty ?? entry.quantity ?? 1) || 0;
@@ -86,7 +90,8 @@ export function normalizeInvoice(raw, settings = {}) {
     sid: raw.sid ?? null,
     state: raw.state ?? null,
     siteId: raw.siteId ?? raw.site?.id ?? null,
-    ownerId: raw.ownerId ?? raw.owner?.id ?? null,
+    // Lists give owner as { id, name }; a single read gives the full user
+    ownerId: raw.ownerId ?? (typeof raw.owner === 'string' ? raw.owner : raw.owner?.id) ?? null,
     owner: typeof raw.owner === 'object' ? raw.owner : null,
     invoiceType: raw.type ?? null,
     creditNoteId: raw.meta?.creditNote ?? null,

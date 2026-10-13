@@ -177,6 +177,12 @@ export function evaluate(invoice, customer, cfg, job = {}) {
     return { status: 'held', reason: 'Storeganise credit note (negative total): issue the correction from the original invoice' };
   }
 
+  // Nothing to report: decided before mapping, so an unmappable line on a €0
+  // invoice (e.g. rent fully offset by a credit) does not make it fail
+  if (invoice.totalCents === 0 && settings.zero_value_policy !== 'send') {
+    return { status: 'skipped', reason: 'Zero-value invoice' };
+  }
+
   const kind = customerKind(customer);
   if (kind === 'b2b') {
     // Held, never downgraded to a B2C receipt (FR-CUS-02)

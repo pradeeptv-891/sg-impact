@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch --env-file=.env server.js",
-    "test": "NODE_ENV=test node --test \"test/*.test.js\""
+    "test": "NODE_ENV=test node --test \"test/*.test.js\"",
+    "probe": "node scripts/probe-storeganise.js",
+    "webhook-sandbox": "node scripts/webhook-sandbox.js"
   },
   "dependencies": {
     "express": "^4.19.2",
