@@ -13,7 +13,7 @@ let loadedAt = 0;
 export async function loadConfig({ fresh = false } = {}) {
   if (!fresh && cache && Date.now() - loadedAt < TTL_MS) return cache;
 
-  const [settingsRows, issuer, branches, series, docTypeRules, lineMappings, paymentMethods] = await Promise.all([
+  const [settingsRows, issuer, branches, series, docTypeRules, lineMappings, paymentMethods, companies, companySites] = await Promise.all([
     many('select key, value from einvoice.settings'),
     one('select * from einvoice.issuer where id = 1'),
     many('select * from einvoice.site_branches'),
@@ -21,6 +21,8 @@ export async function loadConfig({ fresh = false } = {}) {
     many('select * from einvoice.doc_type_rules order by priority, id'),
     many('select * from einvoice.line_mappings order by priority, id'),
     many('select * from einvoice.payment_methods'),
+    many('select * from einvoice.companies order by code'),
+    many('select * from einvoice.company_sites'),
   ]);
 
   const settings = Object.fromEntries(settingsRows.map(row => [row.key, row.value]));
@@ -33,6 +35,9 @@ export async function loadConfig({ fresh = false } = {}) {
     docTypeRules,
     lineMappings,
     paymentMethods: Object.fromEntries(paymentMethods.map(row => [row.sg_method, row])),
+    // Multi-company (scope §10); helpers in companies.js
+    companies,
+    companySites: Object.fromEntries(companySites.map(row => [row.sg_site_id, row.company_id])),
   };
   loadedAt = Date.now();
 

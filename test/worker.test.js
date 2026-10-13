@@ -5,12 +5,14 @@ import * as repo from '../src/jobs/repo.js';
 import { runPoll } from '../src/jobs/poll.js';
 import { runReconciliation } from '../src/jobs/reconcile.js';
 import { runWorker } from '../src/jobs/worker.js';
-import { entry, fakeImpact, fakeStoreganise, freshDb, privateCustomer, setSetting, sgInvoice, unpaidInvoice } from './helpers.js';
+import { companyId, entry, fakeImpact, fakeStoreganise, freshDb, privateCustomer, setSetting, sgInvoice, unpaidInvoice } from './helpers.js';
 
 let pg;
+let propco;
 
 beforeEach(async () => {
   pg = await freshDb();
+  propco = await companyId(pg);
 });
 
 async function job(sgInvoiceId = 'inv-1', kind = 'invoice') {
@@ -30,8 +32,8 @@ test('happy path: webhook → job → number → Impact 201 → sent + write-bac
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated', 'site-1');
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated', 'site-1'); // duplicate delivery
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated', 'site-1');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated', 'site-1'); // duplicate delivery
   const summary = await runWorker({ sg, impact });
 
   assert.equal(summary.claimed, 1);
@@ -53,7 +55,7 @@ test('happy path: webhook → job → number → Impact 201 → sent + write-bac
 
   // Nothing more to do: a second run sends nothing and writes nothing
   const writes = sg.writes.length;
-  await repo.enqueueInvoice('inv-1', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.payments.updated');
   await runWorker({ sg, impact });
   assert.equal(impact.sent.length, 1);
   assert.equal(sg.writes.length, writes);
@@ -68,7 +70,7 @@ test('worker never sends an invoice that is not fully paid, B2B or B2C, and uses
   });
   const impact = fakeImpact();
 
-  for (const id of ['inv-1', 'inv-2', 'inv-3']) await repo.enqueueInvoice(id, 'invoice.payments.updated');
+  for (const id of ['inv-1', 'inv-2', 'inv-3']) await repo.enqueueInvoice(propco, id, 'invoice.payments.updated');
   await runWorker({ sg, impact });
 
   for (const id of ['inv-1', 'inv-2', 'inv-3']) {
@@ -85,8 +87,8 @@ test('worker never sends an invoice that is not fully paid, B2B or B2C, and uses
   Object.assign(sg.store.get('inv-3'), {
     state: 'paid', balance: 0, payments: [{ id: 'p1', method: 'card', amount: 100 }, { id: 'p2', method: 'card', amount: 24 }],
   });
-  await repo.enqueueInvoice('inv-2', 'invoice.payments.updated');
-  await repo.enqueueInvoice('inv-3', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-2', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-3', 'invoice.payments.updated');
   await runWorker({ sg, impact });
 
   assert.equal((await job('inv-2')).status, 'sent');
@@ -105,7 +107,7 @@ test('business customer with bad tax data is held, not sent as B2C, and uses no 
   const sg = fakeStoreganise({ 'inv-1': invoice });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   let j = await job();
@@ -131,7 +133,7 @@ test('400 → failed_data, no auto retry; operator re-queue re-sends with the sa
     responses: [{ status: 400, body: { errors: { 'counterParty.address.postal': ['Postal code is invalid'] } } }],
   });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   let j = await job();
@@ -141,13 +143,13 @@ test('400 → failed_data, no auto retry; operator re-queue re-sends with the sa
   assert.equal(sg.store.get('inv-1').customFields.ei_status, 'failed – data');
 
   // Events and time do not resend it
-  await repo.enqueueInvoice('inv-1', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.payments.updated');
   await elapse();
   await runWorker({ sg, impact });
   assert.equal(impact.sent.length, 1);
 
   // A later invoice takes the next number meanwhile
-  await repo.enqueueInvoice('inv-2', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-2', 'invoice.state.updated');
   await runWorker({ sg, impact });
   assert.equal(Number((await job('inv-2')).number), 2);
 
@@ -167,7 +169,7 @@ test('pre-send validation failure consumes no number (FR-MAP-07)', async () => {
   const sg = fakeStoreganise({ 'inv-1': sgInvoice({ total: 999 }) });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   const j = await job();
@@ -182,7 +184,7 @@ test('5xx and timeouts retry with backoff on the same number, then fail (FR-TX-0
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact({ responses: [{ status: 503, body: null }, { status: null, error: 'timeout', body: null }, { status: 502, body: null }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   let j = await job();
@@ -213,7 +215,7 @@ test('409 after a lost response: treated as success, identifiers recovered (FR-T
   // First call lands at Impact but we only see a timeout; the retry gets 409
   const impact = fakeImpact({ responses: [{ acceptAnd: { status: 504, body: null } }, { status: 409, body: { message: 'already submitted' } }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   assert.equal((await job()).status, 'retry');
 
@@ -231,7 +233,7 @@ test('409 with Impact\'s SignatureResponse: identifiers taken straight from the 
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact({ responses: [{ acceptAnd: { status: 408, body: { success: false } } }, { duplicateOf: 0 }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   let j = await job();
   assert.equal(j.status, 'retry');
@@ -250,7 +252,7 @@ test('201 PENDING (sign policy DEFAULT): sent, MARK followed up until AADE assig
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact({ responses: [{ pending: true }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   let j = await job();
@@ -287,7 +289,7 @@ test('201 with status INVALID (sign policy LOOSE) is a data failure, not a succe
     responses: [{ status: 201, body: { success: true, status: 'INVALID', mark: null, message: 'Invalid classification for invoice type' } }],
   });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   const j = await job();
@@ -301,7 +303,7 @@ test('offline issuance: offline QR on outage, then the frozen document is sent w
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact({ responses: [{ status: 503, body: { success: false } }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   let j = await job();
@@ -325,7 +327,7 @@ test('offline issuance: offline QR on outage, then the frozen document is sent w
   assert.equal(j.qr_url, impact.docs[0].url, 'real QR replaces the offline one');
 
   // …and the later change in Storeganise is flagged, not re-sent
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   assert.equal((await job()).changed_after_issue, true);
   assert.equal(impact.sent.length, 2);
@@ -335,7 +337,7 @@ test('crash mid-send: the expired lease is reclaimed and resent under the same n
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   const [claimed] = await repo.claimJobs({ limit: 1, leaseSeconds: 300, transmit: true });
   await repo.reserveNumber(claimed.id, { series: 'TPY', invoiceTypeCode: '2.1', customerKind: 'b2b' });
   await pg.query(`update einvoice.jobs set status = 'sending', locked_until = now() - interval '1 second' where id = $1`, [claimed.id]);
@@ -351,7 +353,7 @@ test('kill switch: jobs queue while paused and go out on resume (FR-CFG-05)', as
   const impact = fakeImpact();
 
   await pg.query(`select einvoice.set_paused(true)`);
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   const summary = await runWorker({ sg, impact });
 
   assert.equal(summary.paused, true);
@@ -369,7 +371,7 @@ test('a Storeganise credit note (negative total) is held, not sent as an invoice
   });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('cn-1', 'invoice.created');
+  await repo.enqueueInvoice(propco, 'cn-1', 'invoice.created');
   await runWorker({ sg, impact });
 
   const j = await job('cn-1');
@@ -386,9 +388,9 @@ test('deleted before issue closes the job; zero-value and deposit-only invoices 
   });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.deleted');
-  await repo.enqueueInvoice('inv-2', 'invoice.state.updated');
-  await repo.enqueueInvoice('inv-3', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.deleted');
+  await repo.enqueueInvoice(propco, 'inv-2', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-3', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   assert.equal((await job('inv-1')).status, 'skipped');
@@ -401,11 +403,11 @@ test('edited after issue: flagged, never re-sent (FR-COR-03)', async () => {
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   Object.assign(sg.store.get('inv-1'), { subtotal: 90, tax: 21.6, total: 111.6, entries: [entry('rent', 'Unit A12 — October', 90)] });
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   const j = await job();
@@ -419,10 +421,10 @@ test('voided after issue with credit notes off: flagged "credit note required" (
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   sg.store.get('inv-1').state = 'writtenOff';
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   const j = await job();
@@ -438,13 +440,13 @@ test('credit notes on: partial refund then void → 5.1 notes correlated to the 
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact();
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   const original = await job();
 
   // Partial refund of €31
   sg.store.get('inv-1').payments = [{ id: 'p1', type: 'payment', method: 'card', amount: 124 }, { id: 'r1', type: 'refund', amount: -31 }];
-  await repo.enqueueInvoice('inv-1', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.payments.updated');
   await runWorker({ sg, impact }); // creates the credit job
   await runWorker({ sg, impact }); // sends it
 
@@ -458,13 +460,13 @@ test('credit notes on: partial refund then void → 5.1 notes correlated to the 
   assert.deepEqual(partial.CorrelatedInvoices, [Number(original.mark)]);
 
   // The same refund seen again does nothing
-  await repo.enqueueInvoice('inv-1', 'invoice.payments.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.payments.updated');
   await runWorker({ sg, impact });
   assert.equal((await job('inv-1', 'credit_note')).length, 1);
 
   // Then the invoice is deleted: credit the remaining €93
   sg.store.delete('inv-1');
-  await repo.enqueueInvoice('inv-1', 'invoice.deleted');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.deleted');
   await runWorker({ sg, impact });
   await runWorker({ sg, impact });
 
@@ -483,12 +485,12 @@ test('number reserved, then invoice deleted before sending: still issued, then c
   const sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   const impact = fakeImpact({ responses: [{ status: 503, body: null }] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
   assert.equal((await job()).status, 'retry');
 
   sg.store.delete('inv-1');
-  await repo.enqueueInvoice('inv-1', 'invoice.deleted');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.deleted');
   await elapse();
   await runWorker({ sg, impact }); // sends number 1 from the snapshot, queues the credit
   await runWorker({ sg, impact }); // sends the credit
@@ -522,7 +524,7 @@ test('nightly reconciliation: finds missing jobs, unknown and duplicate document
   const sg = fakeStoreganise({ 'inv-1': sgInvoice(), 'inv-2': sgInvoice({ id: 'inv-2' }), 'inv-3': unpaidInvoice({ id: 'inv-3' }) });
   const impact = fakeImpact({ responses: ['accept'] });
 
-  await repo.enqueueInvoice('inv-1', 'invoice.state.updated');
+  await repo.enqueueInvoice(propco, 'inv-1', 'invoice.state.updated');
   await runWorker({ sg, impact });
 
   // A document issued outside the add-on, and a duplicate of our series/number

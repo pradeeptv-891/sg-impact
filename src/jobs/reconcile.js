@@ -1,9 +1,11 @@
+import { pollAccounts, storeganiseFor } from '../companies.js';
 import { many, one, query } from '../db.js';
 import { yyyymmdd } from '../impact-api.js';
 import { toCents } from '../mydata/money.js';
 import { normalizeInvoice } from '../mydata/normalize.js';
 import { isFullyPaid } from '../mydata/rules.js';
 import { loadConfig } from '../settings.js';
+import { queuePaidInvoice } from './capture.js';
 import * as repo from './repo.js';
 
 /**
@@ -13,9 +15,14 @@ import * as repo from './repo.js';
  * v_open_reconciliation_issues view). Two findings are fixed automatically: a
  * fully paid invoice with no job is queued, and a sent job missing its MARK gets it
  * from Impact. Everything else is left for an operator.
+ *
+ * The Storeganise step runs per account (scope §10), like the poll. The add-on
+ * and Impact steps still cover every job against the one configured issuer; they
+ * become per company with the Impact side.
  */
-export async function runReconciliation({ sg, impact }) {
-  const { settings } = await loadConfig({ fresh: true });
+export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganiseFor, impact }) {
+  const cfg = await loadConfig({ fresh: true });
+  const { settings } = cfg;
   const windowTo = new Date();
   const windowFrom = new Date(windowTo.getTime() - (Number(settings.reconcile_lookback_days) || 3) * 86400000);
   const staleBefore = new Date(windowTo.getTime() - (Number(settings.reconcile_stale_minutes) || 60) * 60000);
@@ -30,16 +37,28 @@ export async function runReconciliation({ sg, impact }) {
 
   try {
     // --- 1. Storeganise: every fully paid invoice has a job ---------------------------
-    const sgInvoices = await listAll(sg, windowFrom.toISOString(), Number(settings.poll_page_size) || 100);
-    const paid = sgInvoices.filter(i => isFullyPaid(normalizeInvoice(i, settings), settings));
-    const jobsForPaid = new Map(
-      (await repo.jobsByInvoiceIds(paid.map(i => String(i.id)))).map(j => [j.sg_invoice_id, j]),
-    );
+    let sgInvoiceCount = 0;
+    let paidCount = 0;
 
-    for (const invoice of paid) {
-      if (!jobsForPaid.has(String(invoice.id))) {
-        add('missing_job', { sg_invoice_id: String(invoice.id), details: { state: invoice.state, action: 'queued' } });
-        await repo.enqueueInvoice(String(invoice.id), 'reconcile', invoice.siteId || null);
+    for (const { owner, companies } of pollAccounts(cfg)) {
+      const sgInvoices = await listAll(sgFor(owner), windowFrom.toISOString(), Number(settings.poll_page_size) || 100);
+      const paid = sgInvoices.filter(i => isFullyPaid(normalizeInvoice(i, settings), settings));
+      sgInvoiceCount += sgInvoices.length;
+      paidCount += paid.length;
+
+      const jobsForPaid = new Map(
+        (await repo.jobsByInvoiceIds(companies.map(c => c.id), paid.map(i => String(i.id)))).map(j => [j.sg_invoice_id, j]),
+      );
+
+      for (const invoice of paid) {
+        if (jobsForPaid.has(String(invoice.id))) continue;
+        const out = await queuePaidInvoice({
+          cfg, company: owner, invoiceId: String(invoice.id), siteId: invoice.siteId || null, event: 'reconcile',
+        });
+        add('missing_job', {
+          sg_invoice_id: String(invoice.id), job_id: out.jobId,
+          details: { company: owner.code, state: invoice.state, action: out.unmappedSite !== undefined ? 'unmapped site' : 'queued' },
+        });
       }
     }
 
@@ -138,8 +157,8 @@ export async function runReconciliation({ sg, impact }) {
     }
 
     const summary = {
-      storeganiseInvoices: sgInvoices.length,
-      paid: paid.length,
+      storeganiseInvoices: sgInvoiceCount,
+      paid: paidCount,
       jobs: jobs.length,
       impactDocuments: docs.ok ? docs.documents.length : null,
       issues: countBy(issues, 'issue'),

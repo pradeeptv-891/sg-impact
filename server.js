@@ -17,7 +17,8 @@ app.use(express.json({
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-app.post('/webhook', handleWebhook);
+// One URL per company: /sg-webhook/<einvoice.companies.code> (scope §10.2)
+app.post('/sg-webhook/:code', handleWebhook);
 
 // pg_cron → pg_net → here (worker, poll, reconcile)
 mountJobRoutes(app);

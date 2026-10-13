@@ -3,6 +3,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import * as impact from '../src/impact-api.js';
 import { clearSecretCache } from '../src/secrets.js';
+import { loadConfig } from '../src/settings.js';
 import storeganiseApi from '../src/storeganise-api.js';
 import { freshDb, setSetting } from './helpers.js';
 
@@ -31,7 +32,7 @@ beforeEach(async () => {
     create function einvoice.get_secret(p_name text) returns text language sql as $$
       select case p_name
         when 'impact_uat_api_key' then 'uat-key'
-        when 'sg_api_key' then 'sg-key'
+        when 'sg_propco_api_key' then 'sg-key'
       end
     $$;
   `);
@@ -144,7 +145,9 @@ test('Impact: network failure is transient; getdocuments pages and finds by seri
 });
 
 test('Storeganise: ApiKey auth, custom fields merged, write-back audited, 404 â†’ null', async () => {
-  const sg = storeganiseApi();
+  const { companies } = await loadConfig({ fresh: true });
+  const propco = companies.find(c => c.code === 'propco');
+  const sg = storeganiseApi({ company: propco });
   mockFetch([
     { status: 200, body: { id: 'inv-1', customFields: { other_integration: 'keep' } } },
     { status: 200, body: {} },
@@ -153,7 +156,7 @@ test('Storeganise: ApiKey auth, custom fields merged, write-back audited, 404 â†
 
   await sg.updateInvoiceCustomFields('inv-1', { ei_status: 'sent' });
   assert.equal(calls[0].headers.Authorization, 'ApiKey sg-key');
-  assert.equal(calls[0].url, 'https://acme.storeganise.com/api/v1/admin/invoices/inv-1?include=owner,payments,customFields');
+  assert.equal(calls[0].url, 'https://acme.storeganise.com/api/v1/admin/invoices/inv-1?include=customFields');
   assert.equal(calls[1].method, 'PUT');
   assert.deepEqual(JSON.parse(calls[1].body), { customFields: { other_integration: 'keep', ei_status: 'sent' } });
 
@@ -162,4 +165,81 @@ test('Storeganise: ApiKey auth, custom fields merged, write-back audited, 404 â†
   const { rows } = await pg.query(`select * from einvoice.audit_log where kind = 'storeganise'`);
   assert.equal(rows.length, 1);
   assert.deepEqual(rows[0].request, { ei_status: 'sent' });
+  assert.equal(rows[0].company_id, propco.id);
+});
+
+// Storeganise add-on technical reference / API best practices (articles 475, 297)
+
+async function propcoClient() {
+  const { companies } = await loadConfig({ fresh: true });
+  return storeganiseApi({ company: companies.find(c => c.code === 'propco') });
+}
+
+test('Storeganise: 429 / 5xx retried, honouring Retry-After; then gives up as transient', async () => {
+  const sg = await propcoClient();
+  mockFetch([
+    { status: 429, body: {}, headers: { 'Retry-After': '0' } },
+    { status: 503, body: {}, headers: { 'Retry-After': '0' } },
+    { status: 200, body: { id: 'inv-1' } },
+  ]);
+  assert.deepEqual(await sg.getInvoice('inv-1'), { id: 'inv-1' });
+  assert.equal(calls.length, 3);
+
+  mockFetch([
+    { status: 502, body: {}, headers: { 'Retry-After': '0' } },
+    { status: 502, body: {}, headers: { 'Retry-After': '0' } },
+    { status: 502, body: {}, headers: { 'Retry-After': '0' } },
+    { status: 200, body: {} },
+  ]);
+  await assert.rejects(sg.getInvoice('inv-1'), err => err.status === 502 && err.permanent === false);
+  assert.equal(calls.length, 3, 'two retries by default (sg_retry_attempts)');
+});
+
+test('Storeganise: other 4xx are permanent and not retried; POST is never retried', async () => {
+  const sg = await propcoClient();
+  mockFetch([{ status: 400, body: { error: { message: 'Bad request' } } }, { status: 200, body: {} }]);
+  await assert.rejects(sg.getInvoice('inv-1'), err => err.permanent === true && /Bad request/.test(err.message));
+  assert.equal(calls.length, 1);
+
+  mockFetch([{ status: 503, body: {}, headers: { 'Retry-After': '0' } }, { status: 200, body: {} }]);
+  await assert.rejects(sg.post('/v1/admin/something', {}), err => err.status === 503);
+  assert.equal(calls.length, 1);
+});
+
+test('Storeganise: a deadline stops retries that would not fit (webhook 30s rule)', async () => {
+  const sg = await propcoClient();
+  mockFetch([{ status: 503, body: {}, headers: { 'Retry-After': '5' } }, { status: 200, body: {} }]);
+  const started = Date.now();
+  await assert.rejects(sg.getInvoice('inv-1', { deadline: Date.now() + 1000 }), err => err.status === 503);
+  assert.equal(calls.length, 1);
+  assert.ok(Date.now() - started < 1000, 'did not wait past the deadline');
+
+  await assert.rejects(sg.getInvoice('inv-1', { deadline: Date.now() - 1 }), /no time left/);
+});
+
+test('Storeganise: requests to one account run in series, across clients of companies sharing it', async () => {
+  const { companies } = await loadConfig({ fresh: true });
+  const propco = companies.find(c => c.code === 'propco');
+  const a = storeganiseApi({ company: propco });
+  const b = storeganiseApi({ company: { ...propco, id: 'other', code: 'propco' } });
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  globalThis.fetch = async () => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise(r => setTimeout(r, 20));
+    inFlight--;
+    return new Response('{}', { status: 200 });
+  };
+
+  await Promise.all([a.getInvoice('1'), b.getInvoice('2'), a.getUser('u'), b.listInvoices({})]);
+  assert.equal(maxInFlight, 1);
+});
+
+test('Storeganise: write-back reads only the custom fields it merges', async () => {
+  const sg = await propcoClient();
+  mockFetch([{ status: 200, body: { id: 'inv-1', customFields: {} } }, { status: 200, body: {} }]);
+  await sg.updateInvoiceCustomFields('inv-1', { ei_status: 'sent' });
+  assert.match(calls[0].url, /\/v1\/admin\/invoices\/inv-1\?include=customFields$/);
 });

@@ -5,14 +5,16 @@ import { beforeEach, test } from 'node:test';
 import handleWebhook, { setStoreganiseClient } from '../main.js';
 import { clearSecretCache } from '../src/secrets.js';
 import { StoreganiseError } from '../src/storeganise-api.js';
-import { fakeStoreganise, freshDb, privateCustomer, sgInvoice, unpaidInvoice } from './helpers.js';
+import { runWorker } from '../src/jobs/worker.js';
+import { businessCustomer, fakeImpact, fakeStoreganise, freshDb, privateCustomer, sgInvoice, unpaidInvoice } from './helpers.js';
 
 let pg;
 let sg;
 
 beforeEach(async () => {
   pg = await freshDb();
-  await pg.exec(`create function einvoice.get_secret(p_name text) returns text language sql as $$ select 'whsec' $$`);
+  await pg.exec(`create function einvoice.get_secret(p_name text) returns text language sql as $$
+    select case p_name when 'sg_propco_webhook_secret' then 'whsec' end $$`);
   clearSecretCache();
   sg = fakeStoreganise({ 'inv-1': sgInvoice() });
   setStoreganiseClient(sg);
@@ -22,10 +24,11 @@ async function jobs() {
   return (await pg.query(`select * from einvoice.jobs`)).rows;
 }
 
-async function deliver(body, { secret = 'whsec' } = {}) {
+async function deliver(body, { secret = 'whsec', code = 'propco' } = {}) {
   const raw = Buffer.from(JSON.stringify(body));
   const req = {
     headers: { 'sg-signature': crypto.createHmac('sha256', secret).update(raw).digest('base64') },
+    params: { code },
     rawBody: raw,
     body,
   };
@@ -155,4 +158,33 @@ test('plain Storeganise webhook (no businessCode / apiUrl in the body) is accept
   const res = await deliver({ id: 'evt-1', created: new Date().toISOString(), type: 'invoice.payments.updated', data: { invoiceId: 'inv-1' } });
   assert.equal(res.statusCode, 200);
   assert.equal(res.payload.queued, true);
+});
+
+test('user.updated re-checks that customer\'s held invoices at once; sent once fixed (FR-CUS-02)', async () => {
+  sg.store.set('inv-1', sgInvoice({ owner: businessCustomer({ ei_afm: '' }) }));
+  await deliver(event('invoice.payments.updated'));
+
+  const impact = fakeImpact();
+  await runWorker({ sg, impact });
+  let [job] = await jobs();
+  assert.equal(job.status, 'held');
+  assert.equal(job.sg_owner_id, 'user-b2b');
+  assert.ok(new Date(job.next_attempt_at) > new Date(Date.now() + 30 * 60000), 'hourly re-check scheduled');
+
+  // Another customer changing does nothing
+  const other = await deliver(event('user.updated', { userId: 'someone-else' }));
+  assert.equal(other.statusCode, 200);
+  assert.equal(other.payload.recheck, 0);
+
+  // Staff add the ΑΦΜ in Storeganise
+  sg.store.get('inv-1').owner = businessCustomer();
+  const reads = sg.reads;
+  const fixed = await deliver(event('user.updated', { userId: 'user-b2b' }));
+  assert.equal(fixed.payload.recheck, 1);
+  assert.equal(sg.reads, reads, 'nothing is read from Storeganise in the webhook');
+
+  await runWorker({ sg, impact });
+  [job] = await jobs();
+  assert.equal(job.status, 'sent');
+  assert.equal(impact.sent.length, 1);
 });

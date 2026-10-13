@@ -31,8 +31,13 @@ export async function freshDb(settings = {}) {
     [ISSUER_AFM],
   );
 
-  const all = { sg_api_url: 'https://acme.storeganise.com/api', sg_business_code: 'acme', ...settings };
-  for (const [key, value] of Object.entries(all)) {
+  // Propco is seeded by the companies migration; point it at a test account
+  await pg.query(
+    `update einvoice.companies set sg_api_url = 'https://acme.storeganise.com/api', sg_business_code = 'acme'
+      where code = 'propco'`,
+  );
+
+  for (const [key, value] of Object.entries(settings)) {
     await pg.query(
       `insert into einvoice.settings (key, value) values ($1, $2)
        on conflict (key) do update set value = excluded.value`,
@@ -43,6 +48,26 @@ export async function freshDb(settings = {}) {
   setDb({ query: (text, params) => pg.query(text, params) });
   clearConfigCache();
   return pg;
+}
+
+/** Adds a company (scope §10) and returns its row. */
+export async function addCompany(pg, code, fields = {}) {
+  const row = {
+    legal_name: `${code} SA`, routing_mode: 'account',
+    sg_api_url: `https://${code}.storeganise.com/api`, sg_business_code: code, ...fields,
+  };
+  const { rows } = await pg.query(
+    `insert into einvoice.companies (code, legal_name, routing_mode, sg_api_url, sg_business_code)
+     values ($1, $2, $3, $4, $5) returning *`,
+    [code, row.legal_name, row.routing_mode, row.sg_api_url, row.sg_business_code],
+  );
+  clearConfigCache();
+  return rows[0];
+}
+
+export async function companyId(pg, code = 'propco') {
+  const { rows } = await pg.query(`select id from einvoice.companies where code = $1`, [code]);
+  return rows[0].id;
 }
 
 export async function setSetting(pg, key, value) {

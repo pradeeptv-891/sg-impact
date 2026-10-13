@@ -7,7 +7,9 @@ import { one } from './db.js';
  * logged: the audit log records requests without headers.
  *
  * Vault names (see README):
- *   sg_api_key, sg_webhook_secret, cron_secret,
+ *   sg_<code>_api_key, sg_<code>_webhook_secret   per company (scope §10.1),
+ *     where <code> is einvoice.companies.code; read through getCompanySecrets()
+ *   cron_secret,
  *   impact_uat_api_key, impact_production_api_key
  *     (the one key Impact issues per company; used by all three auth modes)
  */
@@ -34,6 +36,18 @@ export async function getSecret(name, { required = true } = {}) {
 
   cache.set(name, { value, at: Date.now() });
   return value;
+}
+
+/**
+ * A company's Storeganise credentials. Either may be null if not configured yet;
+ * callers decide whether that is fatal.
+ */
+export async function getCompanySecrets(company) {
+  const [sgApiKey, sgWebhookSecret] = await Promise.all([
+    getSecret(`sg_${company.code}_api_key`, { required: false }),
+    getSecret(`sg_${company.code}_webhook_secret`, { required: false }),
+  ]);
+  return { sgApiKey, sgWebhookSecret };
 }
 
 export function clearSecretCache() {

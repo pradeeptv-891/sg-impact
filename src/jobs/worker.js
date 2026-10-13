@@ -1,7 +1,7 @@
 import { audit } from '../audit.js';
+import { companyById, storeganiseFor } from '../companies.js';
 import * as impactApi from '../impact-api.js';
 import { loadConfig } from '../settings.js';
-import storeganiseApi from '../storeganise-api.js';
 import { processCreditJob } from './process-credit.js';
 import { processInvoiceJob } from './process-invoice.js';
 import * as repo from './repo.js';
@@ -10,9 +10,15 @@ import * as repo from './repo.js';
  * Transmission Worker (FRD 2.2). Triggered every minute by pg_cron, and nudged
  * after each webhook. Claims a small batch so a run fits comfortably inside the
  * lease and processes jobs one at a time (Storeganise wants serial API calls).
+ *
+ * Each job is read and written back through its own company's Storeganise client
+ * (scope §10). Inactive companies' jobs are never claimed; a paused company's jobs
+ * are evaluated but not transmitted (FR-CFG-05), as with the global kill switch.
+ *
+ * `sgFor(company)` gives a company's client; tests may pass a single `sg` instead.
  */
 export function defaultContext() {
-  return { sg: storeganiseApi(), impact: impactApi };
+  return { sgFor: storeganiseFor, impact: impactApi };
 }
 
 export async function runWorker(base = defaultContext()) {
@@ -20,7 +26,8 @@ export async function runWorker(base = defaultContext()) {
   const settings = cfg.settings;
   const paused = settings.transmission_paused === true;
   const leaseSeconds = Number(settings.worker_lease_seconds) || 300;
-  const ctx = { ...base, cfg, paused };
+  const { sg, sgFor = () => sg, ...rest } = base;
+  const ctx = { ...rest, cfg, paused };
 
   const summary = { claimed: 0, processed: 0, skipped: 0, errors: 0, statuses: {}, paused };
 
@@ -47,9 +54,11 @@ export async function runWorker(base = defaultContext()) {
 
     let parkFor = null;
     try {
+      const company = companyById(cfg, job.company_id);
+      const jobCtx = { ...ctx, company, sg: sgFor(company), paused: paused || company.paused };
       const out = job.kind === 'credit_note'
-        ? await processCreditJob(job, ctx)
-        : await processInvoiceJob(job, ctx);
+        ? await processCreditJob(job, jobCtx)
+        : await processInvoiceJob(job, jobCtx);
       parkFor = out?.parkFor || null;
       const status = out?.job?.status || job.status;
       summary.statuses[status] = (summary.statuses[status] || 0) + 1;

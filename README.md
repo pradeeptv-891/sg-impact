@@ -11,7 +11,7 @@ drives the schedule and Vault holds the secrets. There is no UI. Staff see resul
 on the invoice (`ei_*` custom fields), and operators use the Supabase dashboard.
 
 ```
-Storeganise ──webhook──▶ /webhook ──▶ einvoice.jobs (one per invoice)
+Storeganise ──webhook──▶ /sg-webhook/{company} ──▶ einvoice.jobs (one per company + invoice)
      ▲                                     │
      │ ei_* custom fields                  ▼   pg_cron → /jobs/worker (every minute)
      └──────────────────── worker: read invoice → eligibility → map → validate
@@ -81,8 +81,9 @@ supabase db push            # applies supabase/migrations
 Add the secrets to Vault (SQL editor):
 
 ```sql
-select vault.create_secret('<storeganise admin api key>', 'sg_api_key');
-select vault.create_secret('<webhook secret set in the add-on config>', 'sg_webhook_secret');
+-- Storeganise, per company: sg_<company code>_api_key / sg_<company code>_webhook_secret
+select vault.create_secret('<storeganise admin api key>', 'sg_propco_api_key');
+select vault.create_secret('<webhook secret set in the add-on config>', 'sg_propco_webhook_secret');
 select vault.create_secret('<long random string>', 'cron_secret');
 select vault.create_secret('<impact UAT api key>', 'impact_uat_api_key');
 -- production, before go-live:
@@ -95,9 +96,33 @@ Configure the issuer and the Storeganise account:
 insert into einvoice.issuer (registered_name, afm, tax_office, street, street_number, city, postal_code)
 values ('<registered name>', '<9-digit ΑΦΜ>', '<ΔΟΥ>', '<street>', '<no>', '<city>', '<postcode>');
 
-update einvoice.settings set value = '"https://<business>.storeganise.com/api"' where key = 'sg_api_url';
-update einvoice.settings set value = '"<business code>"' where key = 'sg_business_code';
+-- Propco is created by the migrations; point it at its Storeganise account
+update einvoice.companies
+   set sg_api_url = 'https://<business>.storeganise.com/api', sg_business_code = '<business code>'
+ where code = 'propco';
 ```
+
+### Companies (multi-company, scope §10)
+
+Step-by-step for adding a company: [ONBOARDING.md](ONBOARDING.md), with the SQL in
+`supabase/templates/new_company.sql`.
+
+Each company is a row in `einvoice.companies` with a `code` (used in its webhook URL and
+Vault secret names), its Storeganise `sg_api_url` and `sg_business_code`, and a
+`routing_mode`:
+
+- `account` (default): the company has its own Storeganise account and webhook.
+- `site`: several companies share one Storeganise account (same `sg_api_url`). Each
+  invoice belongs to the company its site is mapped to in `einvoice.company_sites`. Add
+  the Storeganise webhook once, to the URL of any one of them. An invoice from an unmapped
+  site becomes a `failed` job with "Unmapped site …" and is never sent; map the site, then
+  `select einvoice.reroute_unmapped_job('<job id>');`.
+
+Adding a company needs no deploy: insert the row (plus `company_sites` in site mode), add
+its two `sg_<code>_*` secrets to Vault and create its webhook. New rows are picked up
+within a minute. Every job and audit row carries `company_id`, and a job's company never
+changes. Issuer, Impact credentials and series are still global (Propco); they become
+per company with the Impact side.
 
 Impact authentication (`impact_auth_mode`) needs only the company's API key in all three modes:
 
@@ -135,11 +160,13 @@ select einvoice.schedule_jobs('https://<your-host>');
     Storeganise keeps the customer address as one free-text line, and a B2B invoice needs the
     city and postcode as separate values.
 - Create an API key: **Main Settings → Developer → API keys → +**, role **admin**. Save it in
-  Vault as `sg_api_key`.
+  Vault as `sg_<company code>_api_key`.
 - Create the webhook: **Main Settings → Developer → Webhooks → +**, URL
-  `https://<your-host>/webhook`, events `invoice.state.updated`,
-  `invoice.payments.updated`, `invoice.deleted` (not `invoice.created`), plus at least one alert receiver email.
-  The webhook secret is in `GET /api/v1/admin/settings`; save it in Vault as `sg_webhook_secret`.
+  `https://<your-host>/sg-webhook/<company code>`, events `invoice.state.updated`,
+  `invoice.payments.updated`, `invoice.deleted` and `user.updated` (not `invoice.created`), plus at
+  least one alert receiver email. `user.updated` lets a held business invoice go out as soon as the
+  customer's tax data is fixed.
+  The webhook secret is in `GET /api/v1/admin/settings`; save it in Vault as `sg_<company code>_webhook_secret`.
 
 ### Local development
 
@@ -158,8 +185,10 @@ npm test                # runs on an in-memory Postgres (PGlite) with the real m
 | Queue overview | `select * from einvoice.v_queue;` |
 | Re-queue after fixing data in Storeganise | `select einvoice.requeue_job('<job id>', 'fixed postcode');` |
 | Re-queue everything that gave up (e.g. after an outage) | `select einvoice.requeue_all(array['failed']);` |
-| Re-read an invoice now | `select einvoice.refresh_invoice('<storeganise invoice id>');` |
-| Pause / resume transmission | `select einvoice.set_paused(true);` / `select einvoice.set_paused(false);` |
+| Re-read an invoice now | `select einvoice.refresh_invoice('<company code>', '<storeganise invoice id>');` |
+| Pause / resume transmission (all companies) | `select einvoice.set_paused(true);` / `select einvoice.set_paused(false);` |
+| Pause / resume one company | `select einvoice.set_company_paused('<company code>', true);` |
+| Move an unmapped-site job once its site is mapped | `select einvoice.reroute_unmapped_job('<job id>');` |
 | Series health / gaps | `select * from einvoice.v_series;` |
 | Reconciliation findings | `select * from einvoice.v_open_reconciliation_issues;` |
 | Full history for an invoice | `select * from einvoice.audit_log where sg_invoice_id = '<id>' order by at;` |

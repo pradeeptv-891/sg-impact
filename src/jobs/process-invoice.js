@@ -1,3 +1,4 @@
+import { routeInvoice } from '../companies.js';
 import { buildDocument } from '../mydata/mapper.js';
 import { fingerprint, normalizeCustomer, normalizeInvoice } from '../mydata/normalize.js';
 import { businessCustomerProblems, customerKind, isFullyPaid } from '../mydata/rules.js';
@@ -7,8 +8,8 @@ import { applyResult } from './transmit.js';
 import { writeBack } from './writeback.js';
 import * as repo from './repo.js';
 
-// A held invoice (missing customer tax data) is re-checked this often, since
-// fixing a customer in Storeganise fires no invoice webhook (FR-CUS-02).
+// A held invoice (missing customer tax data) is re-checked at once on user.updated
+// (see events/user-events.js), and also this often in case that webhook is missed.
 const HELD_RECHECK_SECONDS = 3600;
 
 const ISSUED = ['sent', 'credited'];
@@ -18,7 +19,8 @@ const TRANSMITTABLE = ['pending', 'retry', 'sending'];
  * One invoice job, end to end: read the invoice, decide eligibility, reserve a
  * number, transmit, record the result, handle post-issue changes, write back.
  *
- * `ctx` = { cfg, sg, impact, paused }. Returns { job, parkFor? }.
+ * `ctx` = { cfg, company, sg, impact, paused }; `sg` is the job's company's
+ * client. Returns { job, parkFor? }.
  */
 export async function processInvoiceJob(job, ctx) {
   const { cfg, sg } = ctx;
@@ -71,6 +73,26 @@ export async function processInvoiceJob(job, ctx) {
 
   if (job.sg_site_id === null && invoice.siteId) {
     job = await repo.updateJob(job.id, { sg_site_id: invoice.siteId });
+  }
+  // Remembered so user.updated can re-check this customer's held invoices
+  const ownerId = customer?.id ?? invoice.ownerId;
+  if (ownerId && job.sg_owner_id !== String(ownerId)) {
+    job = await repo.updateJob(job.id, { sg_owner_id: String(ownerId) });
+  }
+
+  // Isolation guard (scope §10.3): in site mode, never issue another company's
+  // invoice, e.g. after a site was re-mapped or an unmapped-site job was re-queued.
+  if (ctx.company?.routing_mode === 'site' && job.number === null && !ISSUED.includes(job.status)) {
+    const owner = routeInvoice(cfg, ctx.company, invoice.siteId);
+    if (owner?.id !== ctx.company.id) {
+      const reason = owner
+        ? `Invoice site ${invoice.siteId} belongs to company ${owner.code}, not ${ctx.company.code}`
+        : `Unmapped site ${invoice.siteId ?? '(none)'}: add it to einvoice.company_sites`;
+      job = await repo.updateJob(job.id, {
+        status: 'failed', status_reason: owner ? 'wrong_company' : 'unmapped_site', last_error: reason,
+      });
+      return { job };
+    }
   }
 
   // --- Already issued: only look for changes, voids and refunds -------------------

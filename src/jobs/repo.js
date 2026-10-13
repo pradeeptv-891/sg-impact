@@ -6,8 +6,30 @@ import { many, one, query } from '../db.js';
 
 const JSON_COLUMNS = new Set(['last_error_detail', 'sg_snapshot', 'request', 'response', 'written_back']);
 
-export async function enqueueInvoice(sgInvoiceId, event, sgSiteId = null) {
-  const row = await one('select einvoice.enqueue_invoice($1, $2, $3) as id', [String(sgInvoiceId), event, sgSiteId]);
+export async function enqueueInvoice(companyId, sgInvoiceId, event, sgSiteId = null) {
+  const row = await one(
+    'select einvoice.enqueue_invoice($1, $2, $3, $4) as id',
+    [companyId, String(sgInvoiceId), event, sgSiteId == null ? null : String(sgSiteId)],
+  );
+  return row.id;
+}
+
+/**
+ * routing_mode = 'site', site not mapped to any company (scope §10.2): a failed
+ * job under the company that found it, so it shows in v_attention and is never
+ * sent. einvoice.reroute_unmapped_job() moves it once the site is mapped.
+ */
+export async function recordUnmappedSite(companyId, sgInvoiceId, event, sgSiteId) {
+  const site = sgSiteId == null ? null : String(sgSiteId);
+  const row = await one(
+    `insert into einvoice.jobs
+       (company_id, sg_invoice_id, sg_site_id, status, status_reason, last_error, needs_eval, last_event, last_event_at)
+     values ($1, $2, $3, 'failed', 'unmapped_site', $4, false, $5, now())
+     on conflict (company_id, sg_invoice_id, kind, correction_key) do update
+        set last_event = excluded.last_event, last_event_at = excluded.last_event_at
+     returning id`,
+    [companyId, String(sgInvoiceId), site, `Unmapped site ${site ?? '(none)'}: add it to einvoice.company_sites`, event],
+  );
   return row.id;
 }
 
@@ -19,8 +41,18 @@ export async function getJob(id) {
   return one('select * from einvoice.jobs where id = $1', [id]);
 }
 
-export async function getInvoiceJob(sgInvoiceId) {
-  return one(`select * from einvoice.jobs where sg_invoice_id = $1 and kind = 'invoice'`, [String(sgInvoiceId)]);
+/** Flags a customer's held invoices for re-evaluation (user.updated). */
+export async function recheckCustomer(companyIds, sgOwnerId) {
+  const row = await one('select einvoice.recheck_customer($1, $2) as n', [companyIds, String(sgOwnerId)]);
+  return row.n;
+}
+
+/** The invoice job for a Storeganise invoice, among the given companies (one account). */
+export async function getInvoiceJob(companyIds, sgInvoiceId) {
+  return one(
+    `select * from einvoice.jobs where company_id = any($1) and sg_invoice_id = $2 and kind = 'invoice'`,
+    [companyIds, String(sgInvoiceId)],
+  );
 }
 
 export async function creditJobsFor(parentJobId) {
@@ -88,16 +120,19 @@ export async function reserveNumber(jobId, { series, invoiceTypeCode, customerKi
 export async function createCreditJob({ parent, correctionKey, amountCents, reason }) {
   return one(
     `insert into einvoice.jobs
-       (kind, sg_invoice_id, correction_key, parent_job_id, sg_site_id, status, needs_eval,
+       (kind, company_id, sg_invoice_id, correction_key, parent_job_id, sg_site_id, status, needs_eval,
         customer_kind, credit_amount, credit_reason, next_attempt_at)
-     values ('credit_note', $1, $2, $3, $4, 'pending', false, $5, $6, $7, now())
-     on conflict (sg_invoice_id, kind, correction_key) do nothing
+     values ('credit_note', $8, $1, $2, $3, $4, 'pending', false, $5, $6, $7, now())
+     on conflict (company_id, sg_invoice_id, kind, correction_key) do nothing
      returning *`,
-    [parent.sg_invoice_id, correctionKey, parent.id, parent.sg_site_id, parent.customer_kind, amountCents / 100, reason],
+    [parent.sg_invoice_id, correctionKey, parent.id, parent.sg_site_id, parent.customer_kind, amountCents / 100, reason, parent.company_id],
   );
 }
 
-export async function jobsByInvoiceIds(ids) {
+export async function jobsByInvoiceIds(companyIds, ids) {
   if (!ids.length) return [];
-  return many(`select * from einvoice.jobs where kind = 'invoice' and sg_invoice_id = any($1)`, [ids]);
+  return many(
+    `select * from einvoice.jobs where kind = 'invoice' and company_id = any($1) and sg_invoice_id = any($2)`,
+    [companyIds, ids],
+  );
 }
