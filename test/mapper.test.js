@@ -7,12 +7,13 @@ import { normalizeCustomer, normalizeInvoice } from '../src/mydata/normalize.js'
 import { validateDocument } from '../src/mydata/validate.js';
 import fs from 'fs';
 
-import { businessCustomer, entry, freshDb, privateCustomer, sgInvoice, testConfig } from './helpers.js';
+import { addCompany, addIssuer, businessCustomer, entry, freshDb, privateCustomer, sgInvoice, testConfig } from './helpers.js';
 
 let cfg;
+let pg;
 
 before(async () => {
-  await freshDb();
+  pg = await freshDb();
   cfg = await testConfig();
 });
 
@@ -100,17 +101,107 @@ test('B2C receipt → 11.2, no counterparty, paid by card', () => {
   assert.deepEqual(validateDocument(result.payload, { customerKind: 'b2c' }), []);
 });
 
-test('distribution on: Impact emails the customer (TransmissionMethod E)', async () => {
-  const withEmail = await testConfig({ distribution_enabled: true });
-  const p = build(sgInvoice(), { config: withEmail }).payload;
+/** Propco's config with a notification method, in production unless `uat`. */
+function notifyConfig(method, { uat = false, ...settings } = {}) {
+  return {
+    ...cfg,
+    company: { ...cfg.company, transmission_method: method },
+    settings: { ...cfg.settings, impact_env: uat ? 'uat' : 'production', require_approved_mapping: false, ...settings },
+  };
+}
+
+function customerWith({ email = 'accounts@example.gr', phone } = {}) {
+  const owner = businessCustomer();
+  if (email === null) delete owner.email;
+  else owner.email = email;
+  if (phone) owner.phone = phone;
+  return owner;
+}
+
+test('notifications: E emails Impact\'s copy to the customer; no email → archive only', () => {
+  assert.equal(cfg.company.transmission_method, 'E', 'email is the default for a company');
+
+  const p = build(sgInvoice(), { config: notifyConfig('E') }).payload;
   assert.deepEqual(p.AdditionalDetails, {
     TransmissionMethod: 'E', AvoidEmailGrouping: false, AccountingDepartmentEmails: ['accounts@example.gr'],
   });
+  assert.deepEqual(validateDocument(p, { customerKind: 'b2b' }), []);
 
-  const owner = businessCustomer();
-  delete owner.email;
-  const noEmail = build(sgInvoice({ owner }), { config: withEmail }).payload;
-  assert.equal(noEmail.AdditionalDetails.TransmissionMethod, 'A');
+  const noEmail = build(sgInvoice({ owner: customerWith({ email: null }) }), { config: notifyConfig('E') });
+  assert.equal(noEmail.ok, true, 'a missing email never holds the document back');
+  assert.deepEqual(noEmail.payload.AdditionalDetails, {
+    TransmissionMethod: 'A', AvoidEmailGrouping: false, AccountingDepartmentEmails: [''],
+  });
+
+  const archive = build(sgInvoice(), { config: notifyConfig('A') }).payload;
+  assert.equal(archive.AdditionalDetails.TransmissionMethod, 'A');
+});
+
+test('notifications: M / C send SMS-Viber to a Greek mobile in +3069… format, falling back when missing', () => {
+  const mobile = sgInvoice({ owner: customerWith({ phone: '69 1234-5678' }) });
+
+  const c = build(mobile, { config: notifyConfig('C') }).payload;
+  assert.deepEqual(c.AdditionalDetails, {
+    TransmissionMethod: 'C', AvoidEmailGrouping: false,
+    AccountingDepartmentEmails: ['accounts@example.gr'], CustomerCellNumbers: ['+306912345678'],
+  });
+  assert.deepEqual(validateDocument(c, { customerKind: 'b2b' }), []);
+
+  const m = build(mobile, { config: notifyConfig('M') }).payload;
+  assert.deepEqual([m.AdditionalDetails.TransmissionMethod, m.AdditionalDetails.AccountingDepartmentEmails, m.AdditionalDetails.CustomerCellNumbers],
+    ['M', [''], ['+306912345678']]);
+
+  // A landline is not supported by Impact: C becomes email only, M falls back to email
+  const landline = sgInvoice({ owner: customerWith({ phone: '+30 210 1234567' }) });
+  assert.equal(build(landline, { config: notifyConfig('C') }).payload.AdditionalDetails.TransmissionMethod, 'E');
+  assert.equal(build(landline, { config: notifyConfig('M') }).payload.AdditionalDetails.TransmissionMethod, 'E');
+
+  // No email, mobile only: C becomes M
+  const onlyMobile = sgInvoice({ owner: customerWith({ email: null, phone: '+306912345678' }) });
+  assert.equal(build(onlyMobile, { config: notifyConfig('C') }).payload.AdditionalDetails.TransmissionMethod, 'M');
+});
+
+test('notifications in UAT never reach real customers: test contacts or nothing', () => {
+  const mobile = sgInvoice({ owner: customerWith({ phone: '6912345678' }) });
+
+  const silent = build(mobile, { config: notifyConfig('C', { uat: true }) }).payload;
+  assert.deepEqual(silent.AdditionalDetails, {
+    TransmissionMethod: 'A', AvoidEmailGrouping: false, AccountingDepartmentEmails: [''],
+  });
+
+  const test = build(mobile, {
+    config: notifyConfig('C', { uat: true, uat_notification_emails: ['qa@gigantic.gr'], uat_notification_phones: ['6900000001'] }),
+  }).payload;
+  assert.deepEqual(test.AdditionalDetails, {
+    TransmissionMethod: 'C', AvoidEmailGrouping: false,
+    AccountingDepartmentEmails: ['qa@gigantic.gr'], CustomerCellNumbers: ['+306900000001'],
+  });
+});
+
+test('mapping: a company\'s own rows override the shared ones for that company only', async () => {
+  const beta = await addCompany(pg, 'beta');
+  await addIssuer(pg, 'beta', '094014201');
+  await pg.query(
+    `insert into einvoice.payment_methods (company_id, sg_method, mydata_code, mydata_name) values ($1, 'bank', 6, 'Web Banking')`,
+    [beta.id],
+  );
+  // Lower precedence by priority than the shared fallback, still wins for beta
+  await pg.query(
+    `insert into einvoice.line_mappings (company_id, customer_kind, priority, nature, classification_type_code, classification_category_code)
+     values ($1, 'b2b', 5000, 'services', 'E3_561_001', 'category1_2')`,
+    [beta.id],
+  );
+
+  const betaCfg = await testConfig({}, 'beta');
+  const b = build(sgInvoice(), { config: betaCfg }).payload;
+  assert.equal(b.Issuer.Vat, 'EL094014201');
+  assert.equal(b.PaymentDetails.PaymentMethods[0].PaymentMethodTypeCode, 6);
+  assert.equal(b.Details[0].IncomeClassification.ClassificationCategoryCode, 'category1_2');
+
+  const p = build(sgInvoice(), { config: await testConfig() }).payload;
+  assert.equal(p.Issuer.Vat, 'EL999645320');
+  assert.equal(p.PaymentDetails.PaymentMethods[0].PaymentMethodTypeCode, 1);
+  assert.equal(p.Details[0].IncomeClassification.ClassificationCategoryCode, 'category1_3');
 });
 
 test('deposit excluded, goods line, discount allocated across same-rate lines', () => {

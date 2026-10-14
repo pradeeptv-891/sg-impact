@@ -86,6 +86,9 @@ export function validateDocument(payload, { customerKind, isCredit = false } = {
   if (additional.TransmissionMethod === 'E' && !(additional.AccountingDepartmentEmails || []).some(Boolean)) {
     errors.push('Email delivery requested but the customer has no email');
   }
+  if (['M', 'C'].includes(additional.TransmissionMethod) && !(additional.CustomerCellNumbers || []).some(Boolean)) {
+    errors.push('SMS / Viber delivery requested but the customer has no Greek mobile number');
+  }
 
   return [...new Set(errors)];
 }

@@ -123,7 +123,9 @@ export function normalizeCustomer(owner) {
 
   return {
     id: owner.id ?? null,
-    email: owner.email ?? null,
+    email: clean(owner.email),
+    // Storeganise user phone; used for SMS / Viber when the company notifies by mobile
+    phone: clean(owner.phone) || clean(owner.mobile),
     name,
     isBusiness: truthy(cf.ei_is_business),
     companyName: clean(cf.ei_company_name) || clean(owner.companyName) || clean(owner.company) || null,

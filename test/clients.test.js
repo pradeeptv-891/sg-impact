@@ -5,10 +5,11 @@ import * as impact from '../src/impact-api.js';
 import { clearSecretCache } from '../src/secrets.js';
 import { loadConfig } from '../src/settings.js';
 import storeganiseApi from '../src/storeganise-api.js';
-import { freshDb, setSetting } from './helpers.js';
+import { addCompany, addIssuer, freshDb, setSetting } from './helpers.js';
 
 let pg;
 let calls;
+let client; // Propco's Impact client
 const realFetch = globalThis.fetch;
 
 /** Queue of responses for the mocked fetch; each call is recorded. */
@@ -31,13 +32,15 @@ beforeEach(async () => {
   await pg.exec(`
     create function einvoice.get_secret(p_name text) returns text language sql as $$
       select case p_name
-        when 'impact_uat_api_key' then 'uat-key'
+        when 'impact_propco_uat_api_key' then 'uat-key'
         when 'sg_propco_api_key' then 'sg-key'
       end
     $$;
   `);
   clearSecretCache();
   impact.resetTokenCache();
+  const { companies } = await loadConfig({ fresh: true });
+  client = impact.impactFor(companies.find(c => c.code === 'propco'));
 });
 
 afterEach(() => {
@@ -47,7 +50,7 @@ afterEach(() => {
 test('Impact: APIKey header, UAT URL, audit log without credentials', async () => {
   mockFetch([{ status: 201, body: { mark: '400001', uid: 'U1', authenticationCode: 'A1', url: 'https://q' } }]);
 
-  const result = await impact.sendDocument({ series: 'TPY', number: '1' }, { jobId: null, sgInvoiceId: 'inv-1' });
+  const result = await client.sendDocument({ series: 'TPY', number: '1' }, { jobId: null, sgInvoiceId: 'inv-1' });
 
   assert.equal(result.outcome, 'success');
   assert.equal(calls[0].url, 'https://einvoiceapiuat.impact.gr/invoice/json');
@@ -68,7 +71,7 @@ test('Impact: production environment switches base URL without code changes (FR-
   clearSecretCache();
   mockFetch([{ status: 201, body: {} }]);
 
-  await impact.sendDocument({});
+  await client.sendDocument({});
   assert.equal(calls[0].url, 'https://einvoiceapi.impact.gr/invoice/json');
   assert.equal(calls[0].headers.APIKey, 'prod-key');
 });
@@ -83,8 +86,8 @@ test('Impact: OAuth2 client credentials (client_id = issuer TIN, secret = API ke
     { status: 201, body: {} },
   ]);
 
-  assert.equal((await impact.sendDocument({})).outcome, 'success');
-  assert.equal((await impact.sendDocument({})).outcome, 'success');
+  assert.equal((await client.sendDocument({})).outcome, 'success');
+  assert.equal((await client.sendDocument({})).outcome, 'success');
 
   assert.deepEqual(calls.map(c => c.url), [
     'https://einvoiceapiuat.impact.gr/oauth/token',
@@ -107,8 +110,8 @@ test('Impact: JWT login with { vat, key }; token reused until it expires', async
     { status: 201, body: {} },
   ]);
 
-  await impact.sendDocument({});
-  await impact.sendDocument({});
+  await client.sendDocument({});
+  await client.sendDocument({});
   assert.equal(calls[0].url, 'https://einvoiceapiuat.impact.gr/Authentication/login');
   assert.deepEqual(JSON.parse(calls[0].body), { vat: 'EL999645320', key: 'uat-key' });
   assert.equal(calls.length, 3, 'one login for both sends');
@@ -128,7 +131,7 @@ test('Impact: SignatureResponse identifiers, numeric MARK kept exact', () => {
 
 test('Impact: network failure is transient; getdocuments pages and finds by series/number', async () => {
   mockFetch([{ throw: 'ECONNRESET' }]);
-  const failed = await impact.sendDocument({});
+  const failed = await client.sendDocument({});
   assert.equal(failed.outcome, 'transient');
   assert.equal(failed.error, 'ECONNRESET');
 
@@ -137,11 +140,41 @@ test('Impact: network failure is transient; getdocuments pages and finds by seri
     { status: 200, body: [{ series: 'TPY', number: '1', mark: 'M1' }], headers: { NextPage: '2' } },
     { status: 200, body: [{ series: 'TPY', number: '0002', mark: 'M2', authenticationCode: 'A2' }] },
   ]);
-  const found = await impact.findDocument({ series: 'TPY', number: 2, dateIssued: new Date() });
+  const found = await client.findDocument({ series: 'TPY', number: 2, dateIssued: new Date() });
   assert.equal(found.document.mark, 'M2');
   assert.equal(found.document.authCode, 'A2');
   assert.match(calls[0].url, /^https:\/\/einvoiceportaluat\.impact\.gr\/api\/invoice\/getdocuments\/EL999645320\/1\/\?From=\d{8}&To=\d{8}$/);
   assert.match(calls[1].url, /\/getdocuments\/EL999645320\/2\//);
+});
+
+test('Impact: each company sends with its own API key and ΑΦΜ; not ready without them (scope §10)', async () => {
+  await addCompany(pg, 'athens');
+  const { companies } = await loadConfig({ fresh: true });
+  const athens = impact.impactFor(companies.find(c => c.code === 'athens'));
+
+  assert.match(await athens.notReady(), /Issuer not configured for company athens/);
+  await addIssuer(pg, 'athens', '094014201');
+  assert.match(await athens.notReady(), /Vault secret impact_athens_uat_api_key/);
+  assert.equal(await client.notReady(), null);
+
+  await pg.exec(`
+    create or replace function einvoice.get_secret(p_name text) returns text language sql as $$
+      select case p_name when 'impact_propco_uat_api_key' then 'uat-key' when 'impact_athens_uat_api_key' then 'athens-key' end
+    $$;
+  `);
+  clearSecretCache();
+  assert.equal(await athens.notReady(), null);
+
+  mockFetch([{ status: 201, body: {} }, { status: 200, body: [] }]);
+  await athens.sendDocument({});
+  await athens.getDocuments({ from: '20261001' });
+  assert.equal(calls[0].headers.APIKey, 'athens-key');
+  assert.match(calls[1].url, /\/getdocuments\/EL094014201\/1\//);
+
+  const { rows } = await pg.query(
+    `select c.code from einvoice.audit_log a join einvoice.companies c on c.id = a.company_id where a.kind = 'impact'`,
+  );
+  assert.deepEqual(rows.map(r => r.code), ['athens', 'athens']);
 });
 
 test('Storeganise: ApiKey auth, custom fields merged, write-back audited, 404 → null', async () => {

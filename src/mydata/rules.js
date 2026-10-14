@@ -33,7 +33,7 @@ function bestMatch(rows, criteria, weights) {
       }
       score += weights[column] || 1;
     }
-    // rows arrive sorted by priority, so the first at a given score wins
+    // rows arrive company rows first, then by priority, so the first at a given score wins
     if (matches && score > bestScore) {
       best = row;
       bestScore = score;

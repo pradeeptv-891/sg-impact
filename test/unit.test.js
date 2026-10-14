@@ -7,6 +7,7 @@ import { classify } from '../src/impact-api.js';
 import { cleanAfm, isValidAfm } from '../src/mydata/afm.js';
 import { readableImpactError } from '../src/mydata/errors.js';
 import { allocate, toCents } from '../src/mydata/money.js';
+import { greekMobile, resolveMethod } from '../src/mydata/notify.js';
 import { fingerprint, normalizeCustomer, normalizeInvoice } from '../src/mydata/normalize.js';
 import { businessCustomerProblems } from '../src/mydata/rules.js';
 import { backoffSeconds } from '../src/jobs/transmit.js';
@@ -189,4 +190,30 @@ test('real Storeganise invoice: lines come from entries, with Storeganise\'s own
   assert.equal(customer.name, 'Test Customer');
   assert.equal(customer.isBusiness, false);
   assert.equal(customer.address.street, 'Universe');
+});
+
+test('greekMobile: Impact\'s +3069XXXXXXXX format; landlines and foreign numbers rejected', () => {
+  assert.equal(greekMobile('6912345678'), '+306912345678');
+  assert.equal(greekMobile('+30 691 234 5678'), '+306912345678');
+  assert.equal(greekMobile('0030-6912345678'), '+306912345678');
+  assert.equal(greekMobile('306912345678'), '+306912345678');
+  assert.equal(greekMobile('(+30) 69 1234 5678'), '+306912345678');
+  assert.equal(greekMobile('2101234567'), null);
+  assert.equal(greekMobile('+302101234567'), null);
+  assert.equal(greekMobile('+447700900123'), null);
+  assert.equal(greekMobile('69123'), null);
+  assert.equal(greekMobile(null), null);
+});
+
+test('resolveMethod: each method falls back to the best the customer\'s contacts allow', () => {
+  const cases = [
+    // method, email, mobile → sent as
+    ['C', true, true, 'C'], ['C', true, false, 'E'], ['C', false, true, 'M'], ['C', false, false, 'A'],
+    ['M', true, true, 'M'], ['M', true, false, 'E'], ['M', false, false, 'A'],
+    ['E', true, true, 'E'], ['E', false, true, 'A'],
+    ['A', true, true, 'A'],
+  ];
+  for (const [method, email, mobile, expected] of cases) {
+    assert.equal(resolveMethod(method, email, mobile), expected, `${method} email=${email} mobile=${mobile}`);
+  }
 });

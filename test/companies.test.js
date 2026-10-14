@@ -8,7 +8,7 @@ import { runWorker } from '../src/jobs/worker.js';
 import { clearSecretCache } from '../src/secrets.js';
 import { clearConfigCache } from '../src/settings.js';
 import { StoreganiseError } from '../src/storeganise-api.js';
-import { addCompany, companyId, fakeImpact, fakeStoreganise, freshDb, sgInvoice, unpaidInvoice } from './helpers.js';
+import { addCompany, addIssuer, companyId, fakeImpact, fakeStoreganise, freshDb, sgInvoice, unpaidInvoice } from './helpers.js';
 
 /**
  * Multi-company, Storeganise side (scope §10): per-company webhook URL and secret,
@@ -74,7 +74,8 @@ async function siteMode() {
     `insert into einvoice.company_sites (sg_site_id, company_id) values ('site-s', $1), ('site-n', $2)`,
     [shared.id, north.id],
   );
-  clearConfigCache();
+  await addIssuer(pg, 'shared', '094014201');
+  await addIssuer(pg, 'north', '090000045');
   return { shared, north };
 }
 
@@ -233,6 +234,7 @@ test('poll on a shared account routes by site, once for the whole account', asyn
 
 test('pausing one company stops only that company (acceptance 11)', async () => {
   const beta = await addCompany(pg, 'beta');
+  await addIssuer(pg, 'beta', '094014201');
   clients.propco = fakeStoreganise({ 'inv-1': sgInvoice() });
   clients.beta = fakeStoreganise({ 'inv-9': sgInvoice({ id: 'inv-9' }) });
 
@@ -248,6 +250,68 @@ test('pausing one company stops only that company (acceptance 11)', async () => 
   await pg.query(`select einvoice.set_company_paused('propco', false)`);
   await runWorker({ sgFor, impact });
   assert.deepEqual((await jobs()).map(j => [j.company, j.status]), [['beta', 'sent'], ['propco', 'sent']]);
+});
+
+test('each company issues under its own ΑΦΜ, Impact client and series counter (scope §10)', async () => {
+  const beta = await addCompany(pg, 'beta');
+  await addIssuer(pg, 'beta', '094014201', { registered_name: 'Beta Storage ΑΕ' });
+  await pg.query(`update einvoice.series set next_number = 50 where code = 'TPY' and company_id = $1`, [propco]);
+  clients.propco = fakeStoreganise({ 'inv-1': sgInvoice() });
+  clients.beta = fakeStoreganise({ 'inv-1': sgInvoice() });   // same Storeganise id, another account
+  await pg.query(`select einvoice.enqueue_invoice($1, 'inv-1', 'test')`, [propco]);
+  await pg.query(`select einvoice.enqueue_invoice($1, 'inv-1', 'test')`, [beta.id]);
+
+  const fakes = { propco: fakeImpact(), beta: fakeImpact() };
+  await runWorker({ sgFor, impactFor: company => fakes[company.code] });
+
+  assert.equal(fakes.propco.sent.length, 1);
+  assert.equal(fakes.beta.sent.length, 1);
+  assert.equal(fakes.propco.sent[0].Issuer.Vat, 'EL999645320');
+  assert.equal(fakes.beta.sent[0].Issuer.Vat, 'EL094014201');
+  assert.equal(fakes.beta.sent[0].Issuer.RegisteredName, 'Beta Storage ΑΕ');
+  // Same series code, separate gapless counters
+  assert.deepEqual([fakes.propco.sent[0].Series, fakes.propco.sent[0].Number], ['TPY', '50']);
+  assert.deepEqual([fakes.beta.sent[0].Series, fakes.beta.sent[0].Number], ['TPY', '1']);
+
+  const { rows } = await pg.query(`select company, code, next_number, issued from einvoice.v_series where code = 'TPY'`);
+  assert.deepEqual(rows.map(r => [r.company, Number(r.next_number), Number(r.issued)]), [['beta', 2, 1], ['propco', 51, 1]]);
+});
+
+test('a company without an Impact API key is evaluated but never sent until the key exists', async () => {
+  clients.propco = fakeStoreganise({ 'inv-1': sgInvoice() });
+  await pg.query(`select einvoice.enqueue_invoice($1, 'inv-1', 'test')`, [propco]);
+
+  const impact = fakeImpact({ notReady: 'Impact API key not configured for company propco (Vault secret impact_propco_uat_api_key)' });
+  const summary = await runWorker({ sgFor, impact });
+
+  assert.equal(impact.sent.length, 0);
+  assert.match(summary.notReady.propco, /impact_propco_uat_api_key/);
+  let [job] = await jobs();
+  assert.equal(job.status, 'pending');
+  assert.equal(job.number, null, 'no number reserved while it cannot be sent');
+  assert.match(job.status_reason, /Impact API key not configured/);
+  assert.equal(clients.propco.writes.at(-1).fields.ei_status, 'pending');
+
+  // Key added: sent on the next run once the job is due again
+  impact.notReadyReason = null;
+  await pg.query(`update einvoice.jobs set locked_until = null`);
+  await runWorker({ sgFor, impact });
+  [job] = await jobs();
+  assert.equal(job.status, 'sent');
+  assert.equal(impact.sent.length, 1);
+});
+
+test('a company without an issuer: its jobs wait untouched (cannot be mapped)', async () => {
+  const beta = await addCompany(pg, 'beta');
+  clients.beta = fakeStoreganise({ 'inv-9': sgInvoice({ id: 'inv-9' }) });
+  await pg.query(`select einvoice.enqueue_invoice($1, 'inv-9', 'test')`, [beta.id]);
+
+  const impact = fakeImpact();
+  const summary = await runWorker({ sgFor, impact });
+  assert.equal(impact.sent.length, 0);
+  assert.equal(clients.beta.reads, 0);
+  assert.match(summary.notReady.beta, /Issuer not configured for company beta/);
+  assert.equal((await jobs())[0].status, 'new');
 });
 
 test("a job's company never changes", async () => {

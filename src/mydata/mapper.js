@@ -1,5 +1,6 @@
 import { NO_VAT_CATEGORY, RATE_BY_VAT_CATEGORY, VAT_CATEGORY_BY_RATE, VAT_EXEMPT_CATEGORY } from './constants.js';
 import { allocate, formatEuros, toEuros } from './money.js';
+import { additionalDetails } from './notify.js';
 import {
   customerKind as kindOf,
   paymentMethodFor,
@@ -172,7 +173,6 @@ export function buildDocument({ invoice, customer, config, job = {}, numbering =
 
   // --- Payload -------------------------------------------------------------------------
   const details = lines.map((line, i) => detailLine(line, i + 1, customerKind));
-  const distribute = settings.distribution_enabled === true && Boolean(customer?.email);
 
   const payload = {
     IAPRSignPolicy: Number(settings.impact_sign_policy ?? 2),
@@ -196,12 +196,8 @@ export function buildDocument({ invoice, customer, config, job = {}, numbering =
         Amount: toEuros(p.amountCents),
       })),
     },
-    // Archive only unless distribution is on: Impact emails by default otherwise
-    AdditionalDetails: {
-      TransmissionMethod: distribute ? 'E' : 'A',
-      AvoidEmailGrouping: false,
-      AccountingDepartmentEmails: distribute ? [customer.email] : [''],
-    },
+    // How Impact delivers its (legal) copy to the customer, per company
+    AdditionalDetails: additionalDetails({ method: config.company?.transmission_method, customer, settings }),
     Details: details,
     Summaries: summaries(totalNet, totalVat),
     VatAnalysis: vatAnalysis(details),

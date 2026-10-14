@@ -48,8 +48,8 @@ Storeganise ──webhook──▶ /sg-webhook/{company} ──▶ einvoice.jobs
    so a document that fails validation never uses one up.
 5. **Transmission (FR-TX).** Documents follow Impact's official JSON samples
    (PascalCase EliseCoreDocument), are sent with `IAPRSignPolicy` 2 (STRICT) and
-   `TransmissionMethod: "A"`, so Impact archives them and does not email anyone
-   unless distribution is switched on. How each Impact response is handled:
+   the company's notification method (see [Customer notifications](#customer-notifications)).
+   How each Impact response is handled:
    - 201 `SUBMITTED`: marked sent, and the MARK, UID, authentication code and QR `url` are written back.
    - 201 `PENDING` (only with sign policy 0): marked sent; the MARK is looked up every 15 minutes until AADE assigns it.
    - 201 `INVALID` (only with sign policy 1): marked failed – data.
@@ -81,22 +81,25 @@ supabase db push            # applies supabase/migrations
 Add the secrets to Vault (SQL editor):
 
 ```sql
--- Storeganise, per company: sg_<company code>_api_key / sg_<company code>_webhook_secret
+-- Per company: sg_<company code>_api_key / sg_<company code>_webhook_secret
 select vault.create_secret('<storeganise admin api key>', 'sg_propco_api_key');
 select vault.create_secret('<webhook secret set in the add-on config>', 'sg_propco_webhook_secret');
-select vault.create_secret('<long random string>', 'cron_secret');
-select vault.create_secret('<impact UAT api key>', 'impact_uat_api_key');
+-- Per company: the Impact API key Impact issued for that company's ΑΦΜ
+select vault.create_secret('<impact UAT api key>', 'impact_propco_uat_api_key');
 -- production, before go-live:
-select vault.create_secret('<impact production api key>', 'impact_production_api_key');
+select vault.create_secret('<impact production api key>', 'impact_propco_production_api_key');
+-- Once
+select vault.create_secret('<long random string>', 'cron_secret');
 ```
 
-Configure the issuer and the Storeganise account:
+Configure Propco's issuer and Storeganise account (Propco and its series are created
+by the migrations; other companies are added with the onboarding template):
 
 ```sql
-insert into einvoice.issuer (registered_name, afm, tax_office, street, street_number, city, postal_code)
-values ('<registered name>', '<9-digit ΑΦΜ>', '<ΔΟΥ>', '<street>', '<no>', '<city>', '<postcode>');
+insert into einvoice.issuer (company_id, registered_name, afm, tax_office, street, street_number, city, postal_code)
+select id, '<registered name>', '<9-digit ΑΦΜ>', '<ΔΟΥ>', '<street>', '<no>', '<city>', '<postcode>'
+  from einvoice.companies where code = 'propco';
 
--- Propco is created by the migrations; point it at its Storeganise account
 update einvoice.companies
    set sg_api_url = 'https://<business>.storeganise.com/api', sg_business_code = '<business code>'
  where code = 'propco';
@@ -118,11 +121,31 @@ Vault secret names), its Storeganise `sg_api_url` and `sg_business_code`, and a
   site becomes a `failed` job with "Unmapped site …" and is never sent; map the site, then
   `select einvoice.reroute_unmapped_job('<job id>');`.
 
-Adding a company needs no deploy: insert the row (plus `company_sites` in site mode), add
-its two `sg_<code>_*` secrets to Vault and create its webhook. New rows are picked up
-within a minute. Every job and audit row carries `company_id`, and a job's company never
-changes. Issuer, Impact credentials and series are still global (Propco); they become
-per company with the Impact side.
+Adding a company needs no deploy: run the template (company, issuer, series, plus
+`company_sites` in site mode), add its `sg_<code>_*` and `impact_<code>_*` secrets to
+Vault and create its webhook. New rows are picked up within a minute. Every job and
+audit row carries `company_id`, and a job's company never changes.
+
+Per company:
+
+- **Issuer** (`einvoice.issuer`, one row per company): the ΑΦΜ, name and address on its
+  documents. Without it, the company's invoices wait untouched.
+- **Impact API key** (Vault `impact_<code>_uat_api_key` / `impact_<code>_production_api_key`):
+  Impact issues one per ΑΦΜ. Without a key for the current environment, the company's
+  invoices are checked and show `pending`, but no number is reserved and nothing is
+  sent; `status_reason` says which secret is missing. They go out within about 20 minutes of
+  the key being added.
+- **Series** (`einvoice.series`, keyed by company and code): each company has its own
+  gapless counters. Companies can use the same codes; Impact's UID includes the ΑΦΜ.
+- **Mapping** (`doc_type_rules`, `line_mappings`, `payment_methods`): shared rows have
+  `company_id` null. A row with a company's id overrides the shared row that matches
+  equally well, for that company only.
+- **Notifications** (`companies.transmission_method`), see
+  [Customer notifications](#customer-notifications).
+
+`select * from einvoice.v_companies;` shows each company's issuer, series and
+notification set-up. Environment, hosts, auth mode, sign policy and retry policy stay
+shared settings.
 
 Impact authentication (`impact_auth_mode`) needs only the company's API key in all three modes:
 
@@ -215,6 +238,8 @@ the listing.
 | Reconciliation findings | `select * from einvoice.v_open_reconciliation_issues;` |
 | Full history for an invoice | `select * from einvoice.audit_log where sg_invoice_id = '<id>' order by at;` |
 | Switch to production | `update einvoice.settings set value = '"production"' where key = 'impact_env';` |
+| Companies and what they still need | `select * from einvoice.v_companies;` |
+| Change how a company's customers are notified | `update einvoice.companies set transmission_method = 'E' where code = '<company code>';` |
 
 Job statuses: `pending`, `sending`, `retry`, `sent`, `held` (customer tax data),
 `failed_data` (validation / Impact 400), `failed` (retries exhausted), `skipped`
@@ -228,10 +253,12 @@ offline-issued document.
 | Table | What |
 |---|---|
 | `einvoice.settings` | Environment, endpoints, auth mode, Storeganise states, retry policy, feature flags. Each row has a description. |
-| `einvoice.doc_type_rules` | Customer kind × region × nature → myDATA type and series. |
-| `einvoice.line_mappings` | Line type / accounting code → VAT category, exemption, income classification, exclusion. |
-| `einvoice.payment_methods` | Storeganise payment method → myDATA payment code. |
-| `einvoice.series` | Gapless counters. Set `next_number` before first use if continuing an existing series. |
+| `einvoice.companies` | Per company: Storeganise account, routing, pause, `transmission_method`. |
+| `einvoice.issuer` | Per company: the issuer on its documents. |
+| `einvoice.doc_type_rules` | Customer kind × region × nature → myDATA type and series. Shared, or per company (`company_id`). |
+| `einvoice.line_mappings` | Line type / accounting code → VAT category, exemption, income classification, exclusion. Shared, or per company. |
+| `einvoice.payment_methods` | Storeganise payment method → myDATA payment code. Shared, or per company. |
+| `einvoice.series` | Gapless counters per company. Set `next_number` before first use if continuing an existing series. |
 | `einvoice.site_branches` | Optional branch code / series suffix per Storeganise site. |
 
 **All seeded rules are placeholders (`approved = false`)** pending the accountant's
@@ -239,19 +266,46 @@ sign-off. In production (`impact_env = production`) the add-on refuses to send a
 document that uses an unapproved row. Set `approved = true` on each row once the
 accountant has signed it off.
 
-## Showing the e-invoice to customers
+## The legal document: Impact's copy
 
-Impact requires these on any rendered or printed copy of the document (Response
-Examples & Error Handling → Mandatory Printing Fields). If the Storeganise invoice
-template will show the e-invoice (FRD 9, pending), it needs:
+**Impact's copy is the legal document**, rendered from Impact's default template
+(colours, logo and labels are set in the Impact portal: Template Configuration,
+admin role; changes also apply to documents already issued). It carries everything
+Decision A.1035/2020 art. 3 §3.10 requires of a provider-issued document: QR code, MARK,
+UID, authentication code, and the provider's name, website and licence number
+(Information systems IMPACT Μον. AE, www.einvoicing.gr,
+2023_10_103Impact_002_Impact eInvoicing_V1_24102023).
 
-- MARK (`ei_mark`), UID (`ei_uid`), authentication code (`ei_auth_code`)
-- QR code of `ei_qr_url`
-- Service provider name "Information systems IMPACT Μον. AE", URL www.einvoicing.gr,
-  licence number 2023_10_103Impact_002_Impact eInvoicing_V1_24102023
+`ei_qr_url` on the Storeganise invoice is the link to that document. The Storeganise
+invoice PDF is not the fiscal document, so its template needs no e-invoicing fields.
 
-The alternative is to let Impact deliver the legal document itself: set
-`distribution_enabled` to true (TransmissionMethod `E`, sent to the customer's email).
+### Customer notifications
+
+Impact sends its copy to the customer, as set per company in
+`einvoice.companies.transmission_method` (Impact: Customer Notifications):
+
+| Method | What the customer gets | Needs |
+|---|---|---|
+| `E` (default) | Email with a link to the document | Storeganise user email |
+| `A` | Nothing; archived at Impact only | |
+| `M` | SMS / Viber | Greek mobile in the Storeganise user `phone` |
+| `C` | Email and SMS / Viber | both |
+
+A customer without the contact the method needs gets the next best one (C → E or M,
+M → E, E → A); the document is issued either way. Phone numbers are sent as
+`+3069XXXXXXXX`; landlines and foreign numbers are not supported by Impact.
+
+```sql
+update einvoice.companies set transmission_method = 'C' where code = 'propco';
+```
+
+**In UAT, customers are never contacted.** Outside production, notifications go to the
+`uat_notification_emails` / `uat_notification_phones` settings instead (JSON arrays),
+and with those empty nothing is sent:
+
+```sql
+update einvoice.settings set value = '["qa@example.gr"]' where key = 'uat_notification_emails';
+```
 
 ### Offline issuance (optional, `offline_qr_enabled`, off by default)
 
@@ -306,8 +360,8 @@ Still to confirm:
 | `server.js`, `main.js` | Express app; webhook signature check, business check, event routing (boilerplate) |
 | `src/events/invoice-events.js` | Webhook handler: upserts the invoice's job |
 | `src/storeganise-api.js` | Storeganise client: serial requests, custom-field write-back |
-| `src/impact-api.js` | Impact client: auth modes, outcome classification, getdocuments |
-| `src/mydata/*` | Normalisation, rules, mapper, validation, ΑΦΜ, money, credit notes, offline QR, error messages |
+| `src/impact-api.js` | Impact client per company: auth modes, outcome classification, getdocuments |
+| `src/mydata/*` | Normalisation, rules, mapper, notifications, validation, ΑΦΜ, money, credit notes, offline QR, error messages |
 | `src/jobs/worker.js` | Claims jobs, renews leases, runs processors |
 | `src/jobs/process-invoice.js` | Eligibility → numbering → transmission → post-issue checks |
 | `src/jobs/process-credit.js` | Credit notes |

@@ -9,9 +9,9 @@ import { one } from './db.js';
  * Vault names (see README):
  *   sg_<code>_api_key, sg_<code>_webhook_secret   per company (scope §10.1),
  *     where <code> is einvoice.companies.code; read through getCompanySecrets()
- *   cron_secret,
- *   impact_uat_api_key, impact_production_api_key
- *     (the one key Impact issues per company; used by all three auth modes)
+ *   impact_<code>_uat_api_key, impact_<code>_production_api_key   per company:
+ *     the one key Impact issues per ΑΦΜ, used by all three auth modes
+ *   cron_secret
  */
 const TTL_MS = 5 * 60 * 1000;
 const cache = new Map();

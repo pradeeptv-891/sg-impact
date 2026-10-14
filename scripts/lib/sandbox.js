@@ -44,8 +44,9 @@ export async function createSandbox({ apiUrl, apiKey, businessCode = null, webho
   );
   // A stand-in issuer so eligibility and mapping run; nothing is ever sent with it
   await pg.query(
-    `insert into einvoice.issuer (registered_name, afm, tax_office, street, street_number, city, postal_code)
-     values ('SANDBOX – not sent', '999645320', 'ΔΟΥ', 'Sandbox', '1', 'Αθήνα', '10000')`,
+    `insert into einvoice.issuer (company_id, registered_name, afm, tax_office, street, street_number, city, postal_code)
+     select id, 'SANDBOX – not sent', '999645320', 'ΔΟΥ', 'Sandbox', '1', 'Αθήνα', '10000'
+       from einvoice.companies where code = 'propco'`,
   );
   await pg.query(`select einvoice.set_paused(true)`);
   clearConfigCache();
@@ -84,8 +85,11 @@ export async function createSandbox({ apiUrl, apiKey, businessCode = null, webho
     put() { throw new Error('sandbox: writes are blocked'); },
   };
 
+  // Transmission is paused, so the worker only asks whether the company is ready
   const impact = new Proxy({}, {
-    get: (_, name) => () => { throw new Error(`sandbox: Impact.${String(name)} must never be called`); },
+    get: (_, name) => (name === 'notReady'
+      ? async () => null
+      : () => { throw new Error(`sandbox: Impact.${String(name)} must never be called`); }),
   });
 
   return { pg, cfg, company, sg, impact, stats, blockedWrites, listPages };

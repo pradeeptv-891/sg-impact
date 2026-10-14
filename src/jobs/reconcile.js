@@ -1,10 +1,10 @@
 import { pollAccounts, storeganiseFor } from '../companies.js';
 import { many, one, query } from '../db.js';
-import { yyyymmdd } from '../impact-api.js';
+import { impactFor as defaultImpactFor, yyyymmdd } from '../impact-api.js';
 import { toCents } from '../mydata/money.js';
 import { normalizeInvoice } from '../mydata/normalize.js';
 import { isFullyPaid } from '../mydata/rules.js';
-import { loadConfig } from '../settings.js';
+import { forCompany, loadConfig } from '../settings.js';
 import { clampUpdatedAfter } from '../storeganise-api.js';
 import { queuePaidInvoice } from './capture.js';
 import * as repo from './repo.js';
@@ -17,11 +17,15 @@ import * as repo from './repo.js';
  * fully paid invoice with no job is queued, and a sent job missing its MARK gets it
  * from Impact. Everything else is left for an operator.
  *
- * The Storeganise step runs per account (scope §10), like the poll. The add-on
- * and Impact steps still cover every job against the one configured issuer; they
- * become per company with the Impact side.
+ * The Storeganise step runs per account (scope §10), like the poll. The Impact
+ * step runs per company: each company's documents are listed under its own ΑΦΜ
+ * and matched against that company's jobs only (series and numbers are per
+ * company, so the same TPY 12 can exist once for each).
  */
-export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganiseFor, impact }) {
+export async function runReconciliation({
+  sg, sgFor = sg ? () => sg : storeganiseFor,
+  impact, impactFor = impact ? () => impact : defaultImpactFor,
+}) {
   const cfg = await loadConfig({ fresh: true });
   const { settings } = cfg;
   const windowTo = new Date();
@@ -82,70 +86,20 @@ export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganis
     }
 
     // --- 3. Impact: every sent document is there, once, with the same MARK/amount ------
-    const docs = await impact.getAllDocuments({ from: yyyymmdd(windowFrom), to: yyyymmdd(windowTo) });
+    let impactDocuments = 0;
+    for (const company of cfg.companies.filter(c => c.active)) {
+      if (!forCompany(cfg, company).issuer) continue;   // nothing can have been issued
+      const client = impactFor(company);
+      const notReady = client.notReady ? await client.notReady() : null;
+      if (notReady) continue;
 
-    if (!docs.ok) {
-      add('impact_unavailable', { details: { status: docs.status || null, error: docs.error || null } });
-    } else {
-      const byKey = new Map();
-      for (const doc of docs.documents) {
-        const key = `${doc.series}|${Number(doc.number)}`;
-        byKey.set(key, [...(byKey.get(key) || []), doc]);
+      const docs = await client.getAllDocuments({ from: yyyymmdd(windowFrom), to: yyyymmdd(windowTo) });
+      if (!docs.ok) {
+        add('impact_unavailable', { details: { company: company.code, status: docs.status || null, error: docs.error || null } });
+        continue;
       }
-
-      // Jobs issued a little before the window too, so edge documents still match
-      const numbered = await many(
-        `select * from einvoice.jobs where date_issued >= $1 or (number is null and sent_at >= $1)`,
-        [new Date(windowFrom.getTime() - 2 * 86400000)],
-      );
-      const jobByKey = new Map(numbered.filter(j => j.number).map(j => [`${j.series_code}|${Number(j.number)}`, j]));
-      const jobByMark = new Map(numbered.filter(j => j.mark).map(j => [j.mark, j]));
-
-      for (const [key, list] of byKey) {
-        if (list.length > 1) {
-          const [series, number] = key.split('|');
-          add('duplicate_in_impact', { series_code: series, number: Number(number), details: { marks: list.map(d => d.mark) } });
-        }
-      }
-
-      for (const job of numbered) {
-        if (!['sent', 'credited'].includes(job.status) || !job.number) continue;
-        if (new Date(job.date_issued) < windowFrom) continue;
-
-        const base = { sg_invoice_id: job.sg_invoice_id, job_id: job.id, series_code: job.series_code, number: job.number };
-        const doc = (byKey.get(`${job.series_code}|${Number(job.number)}`) || [])[0];
-
-        if (!doc) {
-          add('missing_in_impact', { ...base, details: { mark: job.mark } });
-          continue;
-        }
-
-        if (!job.mark && doc.mark) {
-          // Fill in identifiers Impact did not return at send time
-          await repo.updateJob(job.id, {
-            mark: doc.mark, uid: doc.uid, auth_code: doc.authCode, qr_url: doc.url,
-            status_reason: 'Identifiers filled in by reconciliation', writeback_pending: true,
-          });
-          continue;
-        }
-
-        const problems = [];
-        if (job.mark && doc.mark && job.mark !== doc.mark) problems.push(`MARK ${job.mark} vs Impact ${doc.mark}`);
-        if (doc.totalAmount !== null && job.amount_gross !== null && Math.abs(toCents(doc.totalAmount) - toCents(job.amount_gross)) > 1) {
-          problems.push(`amount ${job.amount_gross} vs Impact ${doc.totalAmount}`);
-        }
-        if (problems.length) add('mismatch', { ...base, details: { problems } });
-      }
-
-      for (const doc of docs.documents) {
-        const known = jobByKey.has(`${doc.series}|${Number(doc.number)}`) || (doc.mark && jobByMark.has(doc.mark));
-        if (!known) {
-          add('unknown_in_impact', {
-            series_code: doc.series, number: Number(doc.number) || null,
-            details: { mark: doc.mark, dateIssued: doc.dateIssued, total: doc.totalAmount },
-          });
-        }
-      }
+      impactDocuments += docs.documents.length;
+      await reconcileImpact(company, docs.documents, { windowFrom, add });
     }
 
     for (const issue of issues) {
@@ -161,7 +115,7 @@ export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganis
       storeganiseInvoices: sgInvoiceCount,
       paid: paidCount,
       jobs: jobs.length,
-      impactDocuments: docs.ok ? docs.documents.length : null,
+      impactDocuments,
       issues: countBy(issues, 'issue'),
     };
 
@@ -176,6 +130,70 @@ export async function runReconciliation({ sg, sgFor = sg ? () => sg : storeganis
       [run.id, err.message],
     );
     throw err;
+  }
+}
+
+/** One company's Impact documents against that company's jobs. */
+async function reconcileImpact(company, documents, { windowFrom, add }) {
+  const byKey = new Map();
+  for (const doc of documents) {
+    const key = `${doc.series}|${Number(doc.number)}`;
+    byKey.set(key, [...(byKey.get(key) || []), doc]);
+  }
+
+  // Jobs issued a little before the window too, so edge documents still match
+  const numbered = await many(
+    `select * from einvoice.jobs
+      where company_id = $2 and (date_issued >= $1 or (number is null and sent_at >= $1))`,
+    [new Date(windowFrom.getTime() - 2 * 86400000), company.id],
+  );
+  const jobByKey = new Map(numbered.filter(j => j.number).map(j => [`${j.series_code}|${Number(j.number)}`, j]));
+  const jobByMark = new Map(numbered.filter(j => j.mark).map(j => [j.mark, j]));
+
+  for (const [key, list] of byKey) {
+    if (list.length > 1) {
+      const [series, number] = key.split('|');
+      add('duplicate_in_impact', { series_code: series, number: Number(number), details: { company: company.code, marks: list.map(d => d.mark) } });
+    }
+  }
+
+  for (const job of numbered) {
+    if (!['sent', 'credited'].includes(job.status) || !job.number) continue;
+    if (new Date(job.date_issued) < windowFrom) continue;
+
+    const base = { sg_invoice_id: job.sg_invoice_id, job_id: job.id, series_code: job.series_code, number: job.number };
+    const doc = (byKey.get(`${job.series_code}|${Number(job.number)}`) || [])[0];
+
+    if (!doc) {
+      add('missing_in_impact', { ...base, details: { company: company.code, mark: job.mark } });
+      continue;
+    }
+
+    if (!job.mark && doc.mark) {
+      // Fill in identifiers Impact did not return at send time
+      await repo.updateJob(job.id, {
+        mark: doc.mark, uid: doc.uid, auth_code: doc.authCode, qr_url: doc.url,
+        status_reason: 'Identifiers filled in by reconciliation', writeback_pending: true,
+      });
+      continue;
+    }
+
+    const problems = [];
+    if (job.mark && doc.mark && job.mark !== doc.mark) problems.push(`MARK ${job.mark} vs Impact ${doc.mark}`);
+    if (doc.totalAmount !== null && job.amount_gross !== null && Math.abs(toCents(doc.totalAmount) - toCents(job.amount_gross)) > 1) {
+      problems.push(`amount ${job.amount_gross} vs Impact ${doc.totalAmount}`);
+    }
+    if (problems.length) add('mismatch', { ...base, details: { company: company.code, problems } });
+  }
+
+  for (const doc of documents) {
+    const known = jobByKey.has(`${doc.series}|${Number(doc.number)}`) || (doc.mark && jobByMark.has(doc.mark));
+    if (!known) {
+      add('unknown_in_impact', {
+        series_code: doc.series, number: Number(doc.number) || null,
+        details: { company: company.code, mark: doc.mark, dateIssued: doc.dateIssued, total: doc.totalAmount },
+      });
+    }
   }
 }
 

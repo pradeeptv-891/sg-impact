@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { PGlite } from '@electric-sql/pglite';
 
 import { setDb } from '../src/db.js';
-import { clearConfigCache, loadConfig } from '../src/settings.js';
+import { clearConfigCache, forCompany, loadConfig } from '../src/settings.js';
 import { classify } from '../src/impact-api.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -26,8 +26,9 @@ export async function freshDb(settings = {}) {
   }
 
   await pg.query(
-    `insert into einvoice.issuer (registered_name, afm, tax_office, street, street_number, city, postal_code)
-     values ('Storage Co ΙΚΕ', $1, 'ΔΟΥ Αθηνών', 'Λεωφόρος Κηφισίας', '10', 'Αθήνα', '11526')`,
+    `insert into einvoice.issuer (company_id, registered_name, afm, tax_office, street, street_number, city, postal_code)
+     select id, 'Storage Co ΙΚΕ', $1, 'ΔΟΥ Αθηνών', 'Λεωφόρος Κηφισίας', '10', 'Αθήνα', '11526'
+       from einvoice.companies where code = 'propco'`,
     [ISSUER_AFM],
   );
 
@@ -75,9 +76,32 @@ export async function setSetting(pg, key, value) {
   clearConfigCache();
 }
 
-export async function testConfig(overrides = {}) {
-  const cfg = await loadConfig({ fresh: true });
+/** One company's configuration (Propco by default), with settings overridden. */
+export async function testConfig(overrides = {}, code = 'propco') {
+  const all = await loadConfig({ fresh: true });
+  const cfg = forCompany(all, all.companies.find(c => c.code === code));
   return { ...cfg, settings: { ...cfg.settings, ...overrides } };
+}
+
+/**
+ * Gives a company its own issuer and a copy of Propco's series (fresh counters),
+ * as onboarding does (supabase/templates/new_company.sql).
+ */
+export async function addIssuer(pg, code, afm, fields = {}) {
+  await pg.query(
+    `insert into einvoice.issuer (company_id, registered_name, afm, city, postal_code)
+     select id, $2, $3, 'Θεσσαλονίκη', '54625' from einvoice.companies where code = $1`,
+    [code, fields.registered_name || `${code} ΑΕ`, afm],
+  );
+  await pg.query(
+    `insert into einvoice.series (company_id, code, description)
+     select c.id, s.code, s.description
+       from einvoice.series s
+       join einvoice.companies p on p.id = s.company_id and p.code = 'propco'
+       cross join einvoice.companies c where c.code = $1`,
+    [code],
+  );
+  clearConfigCache();
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +217,7 @@ export function fakeStoreganise(invoices = {}) {
  * SignatureResponse carrying a numeric MARK. { acceptAnd } stores the document but
  * answers with another response (e.g. a lost 201 seen as a timeout).
  */
-export function fakeImpact({ responses = [], documents = [] } = {}) {
+export function fakeImpact({ responses = [], documents = [], notReady = null } = {}) {
   let seq = 400000000000000;
   const sent = [];
   const docs = [...documents];
@@ -223,6 +247,10 @@ export function fakeImpact({ responses = [], documents = [] } = {}) {
     sent,
     docs,
     responses,
+    notReadyReason: notReady,
+    async notReady() {
+      return this.notReadyReason;
+    },
     async sendDocument(payload) {
       sent.push(structuredClone(payload));
       const next = responses.shift();

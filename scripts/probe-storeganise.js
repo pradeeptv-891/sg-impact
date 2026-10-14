@@ -52,7 +52,7 @@ if (Date.now() - since.getTime() > 40 * 86400000) {
 const { createSandbox } = await import('./lib/sandbox.js');
 const { pg, cfg, company, sg, impact, stats, blockedWrites, listPages } = await createSandbox({ apiUrl, apiKey, ignoreVat, maxPages });
 
-const { setState } = await import('../src/settings.js');
+const { forCompany, setState } = await import('../src/settings.js');
 const { runPoll } = await import('../src/jobs/poll.js');
 const { runWorker } = await import('../src/jobs/worker.js');
 const { default: invoiceEvent } = await import('../src/events/invoice-events.js');
@@ -90,7 +90,7 @@ if (invoiceId) {
   const event = await invoiceEvent({ event: 'invoice.payments.updated', data: { invoiceId }, sg, company, cfg });
   line('webhook result:', JSON.stringify(event));
 
-  const decision = evaluate(invoice, customer, cfg);
+  const decision = evaluate(invoice, customer, forCompany(cfg, company));
   line('worker decision:', decision.status, decision.reason ? `– ${decision.reason}` : '(would be sent)');
   if (showPayload && decision.build?.payload) {
     console.log('\nImpact document that would be sent (series/number assigned at send time):');

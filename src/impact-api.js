@@ -1,9 +1,14 @@
 import { audit } from './audit.js';
 import { getSecret } from './secrets.js';
-import { loadConfig } from './settings.js';
+import { forCompany, loadConfig } from './settings.js';
 
 /**
  * IMPACT INVOICING client (FRD 5.1 – 5.3), per developers.s1ecos.com.
+ *
+ * One client per company (scope §10): each company issues under its own ΑΦΜ with
+ * its own API key, from Vault as impact_<code>_uat_api_key /
+ * impact_<code>_production_api_key. Environment, hosts, paths and auth mode are
+ * shared settings.
  *
  * Every call returns an `outcome` instead of throwing, so the caller can apply the
  * FRD's response policy:
@@ -20,33 +25,31 @@ import { loadConfig } from './settings.js';
  *           client_secret = API key → access_token (expires_in 900)
  */
 
-let token = null; // { value, expiresAt, env }
+// Access tokens per company and environment: `${companyId}|${env}` → { value, expiresAt }
+const tokens = new Map();
 
-async function environment() {
-  const { settings, issuer } = await loadConfig();
+export function apiKeySecretName(company, env) {
+  return `impact_${company.code}_${env}_api_key`;
+}
+
+async function environment(company) {
+  const cfg = forCompany(await loadConfig(), company);
+  const { settings, issuer } = cfg;
   const env = settings.impact_env === 'production' ? 'production' : 'uat';
   return {
     env,
+    company,
     settings,
     issuer,
+    secretName: apiKeySecretName(company, env),
     baseUrl: settings[`impact_base_url_${env}`],
     portalUrl: settings[`impact_portal_url_${env}`],
   };
 }
 
-/** The company's Impact API key (also the OAuth client secret and offline-QR salt). */
-export async function apiKey() {
-  const { env } = await environment();
-  return getSecret(`impact_${env}_api_key`);
-}
-
-export async function portalUrl() {
-  return (await environment()).portalUrl;
-}
-
-async function fetchToken({ env, settings, issuer, baseUrl }) {
+async function fetchToken({ settings, issuer, baseUrl, secretName }) {
   const mode = settings.impact_auth_mode;
-  const key = await getSecret(`impact_${env}_api_key`);
+  const key = await getSecret(secretName);
   const tin = `EL${issuer?.afm || ''}`;
 
   let res;
@@ -71,7 +74,7 @@ async function fetchToken({ env, settings, issuer, baseUrl }) {
   // Access tokens last 15 minutes; a new login is simpler than the refresh flow and
   // costs one extra call every quarter of an hour at most.
   const ttlSeconds = Number(body.expires_in || body.expiresIn) || jwtTtl(value) || 900;
-  return { value, env, expiresAt: Date.now() + Math.max(ttlSeconds - 60, 30) * 1000 };
+  return { value, expiresAt: Date.now() + Math.max(ttlSeconds - 60, 30) * 1000 };
 }
 
 function jwtTtl(value) {
@@ -84,15 +87,18 @@ function jwtTtl(value) {
 }
 
 async function authHeaders(ctx, { forceRefresh = false } = {}) {
-  const { env, settings } = ctx;
+  const { env, settings, company } = ctx;
   const mode = settings.impact_auth_mode || 'apikey';
 
   if (mode === 'apikey') {
-    return { [settings.impact_apikey_header || 'APIKey']: await getSecret(`impact_${env}_api_key`) };
+    return { [settings.impact_apikey_header || 'APIKey']: await getSecret(ctx.secretName) };
   }
 
-  if (forceRefresh || !token || token.env !== env || Date.now() >= token.expiresAt) {
+  const key = `${company.id}|${env}`;
+  let token = tokens.get(key);
+  if (forceRefresh || !token || Date.now() >= token.expiresAt) {
     token = await fetchToken(ctx);
+    tokens.set(key, token);
   }
   return { Authorization: `Bearer ${token.value}` };
 }
@@ -135,7 +141,7 @@ async function request(method, url, { body, jobId, sgInvoiceId, ctx, auditBody =
   if (result.status === 401) result = await attempt(true);
 
   await audit({
-    kind: 'impact', jobId, sgInvoiceId, method, url: url.replace(/\?.*$/, ''),
+    kind: 'impact', companyId: ctx.company.id, jobId, sgInvoiceId, method, url: url.replace(/\?.*$/, ''),
     statusCode: result.status, durationMs: result.durationMs,
     request: auditBody ? body : null, response: result.body, error: result.error || null,
   });
@@ -155,61 +161,95 @@ export function classify(status) {
   return 'invalid';
 }
 
-/** POST /invoice/json (FR-TX-02). */
-export async function sendDocument(payload, { jobId, sgInvoiceId } = {}) {
-  const ctx = await environment();
-  return request('POST', `${ctx.baseUrl}${ctx.settings.impact_send_path}`, { body: payload, jobId, sgInvoiceId, ctx });
-}
-
 /**
- * GET getdocuments: one page (max 100) of documents issued through Impact, used
- * for MARK recovery and reconciliation. Served from the portal host. Dates are
- * YYYYMMDD; the NextPage response header is present while more pages exist.
+ * The Impact client for one company. Everything it sends carries that company's
+ * API key and is filed under its ΑΦΜ.
  */
-export async function getDocuments({ from, to, lastUpdate, page = 1 } = {}) {
-  const ctx = await environment();
-  const vat = `EL${ctx.issuer.afm}`;
-  const path = ctx.settings.impact_getdocuments_path
-    .replace('{vat}', encodeURIComponent(vat))
-    .replace('{page}', String(page));
-  const params = new URLSearchParams();
-  if (from) params.set('From', from);
-  if (to) params.set('To', to);
-  if (lastUpdate) params.set('LastUpdate', lastUpdate);
-
-  const result = await request('GET', `${ctx.portalUrl}${path}${params.size ? `?${params}` : ''}`, { ctx });
-  if (result.outcome !== 'success') {
-    return { ok: false, status: result.status, error: result.error, documents: [] };
+export function impactFor(company) {
+  /** POST /invoice/json (FR-TX-02). */
+  async function sendDocument(payload, { jobId, sgInvoiceId } = {}) {
+    const ctx = await environment(company);
+    return request('POST', `${ctx.baseUrl}${ctx.settings.impact_send_path}`, { body: payload, jobId, sgInvoiceId, ctx });
   }
 
-  const body = result.body;
-  const documents = Array.isArray(body) ? body : body?.documents || body?.Documents || body?.items || [];
-  const nextPage = result.headers?.get?.('NextPage') || null;
-  return { ok: true, documents: documents.map(normalizeDocument), nextPage };
-}
+  /**
+   * GET getdocuments: one page (max 100) of the company's documents, used for MARK
+   * recovery and reconciliation. Served from the portal host. Dates are YYYYMMDD;
+   * the NextPage response header is present while more pages exist.
+   */
+  async function getDocuments({ from, to, lastUpdate, page = 1 } = {}) {
+    const ctx = await environment(company);
+    const vat = `EL${ctx.issuer?.afm || ''}`;
+    const path = ctx.settings.impact_getdocuments_path
+      .replace('{vat}', encodeURIComponent(vat))
+      .replace('{page}', String(page));
+    const params = new URLSearchParams();
+    if (from) params.set('From', from);
+    if (to) params.set('To', to);
+    if (lastUpdate) params.set('LastUpdate', lastUpdate);
 
-/** Walks every page of getdocuments. */
-export async function getAllDocuments(filters) {
-  const all = [];
-  for (let page = 1; page <= 500; page++) {
-    const result = await getDocuments({ ...filters, page });
-    if (!result.ok) return { ok: false, status: result.status, error: result.error, documents: all };
-    all.push(...result.documents);
-    if (!result.nextPage || result.documents.length === 0) break;
+    const result = await request('GET', `${ctx.portalUrl}${path}${params.size ? `?${params}` : ''}`, { ctx });
+    if (result.outcome !== 'success') {
+      return { ok: false, status: result.status, error: result.error, documents: [] };
+    }
+
+    const body = result.body;
+    const documents = Array.isArray(body) ? body : body?.documents || body?.Documents || body?.items || [];
+    const nextPage = result.headers?.get?.('NextPage') || null;
+    return { ok: true, documents: documents.map(normalizeDocument), nextPage };
   }
-  return { ok: true, documents: all };
-}
 
-/** Finds a document by series/number around its issue date (MARK recovery). */
-export async function findDocument({ series, number, dateIssued }) {
-  const day = new Date(dateIssued || Date.now());
-  const from = yyyymmdd(new Date(day.getTime() - 86400000));
-  const to = yyyymmdd(new Date(Math.max(day.getTime() + 86400000, Date.now())));
-  const result = await getAllDocuments({ from, to });
-  if (!result.ok) return { ok: false, error: result.error || `getdocuments failed with ${result.status}` };
+  /** Walks every page of getdocuments. */
+  async function getAllDocuments(filters) {
+    const all = [];
+    for (let page = 1; page <= 500; page++) {
+      const result = await getDocuments({ ...filters, page });
+      if (!result.ok) return { ok: false, status: result.status, error: result.error, documents: all };
+      all.push(...result.documents);
+      if (!result.nextPage || result.documents.length === 0) break;
+    }
+    return { ok: true, documents: all };
+  }
 
-  const match = result.documents.find(doc => doc.series === series && Number(doc.number) === Number(number));
-  return { ok: true, document: match || null };
+  /** Finds a document by series/number around its issue date (MARK recovery). */
+  async function findDocument({ series, number, dateIssued }) {
+    const day = new Date(dateIssued || Date.now());
+    const from = yyyymmdd(new Date(day.getTime() - 86400000));
+    const to = yyyymmdd(new Date(Math.max(day.getTime() + 86400000, Date.now())));
+    const result = await getAllDocuments({ from, to });
+    if (!result.ok) return { ok: false, error: result.error || `getdocuments failed with ${result.status}` };
+
+    const match = result.documents.find(doc => doc.series === series && Number(doc.number) === Number(number));
+    return { ok: true, document: match || null };
+  }
+
+  /** The company's Impact API key (also the OAuth client secret and offline-QR salt). */
+  async function apiKey() {
+    return getSecret((await environment(company)).secretName);
+  }
+
+  /**
+   * Why the company cannot send yet, or null when it can: its issuer and its API
+   * key for the current environment must both be configured.
+   */
+  async function notReady() {
+    const ctx = await environment(company);
+    if (!ctx.issuer) return `Issuer not configured for company ${company.code} (einvoice.issuer)`;
+    const key = await getSecret(ctx.secretName, { required: false });
+    if (!key) return `Impact API key not configured for company ${company.code} (Vault secret ${ctx.secretName})`;
+    return null;
+  }
+
+  return {
+    company,
+    sendDocument,
+    getDocuments,
+    getAllDocuments,
+    findDocument,
+    apiKey,
+    notReady,
+    portalUrl: async () => (await environment(company)).portalUrl,
+  };
 }
 
 /**
@@ -266,5 +306,5 @@ export function yyyymmdd(date) {
 
 /** For tests. */
 export function resetTokenCache() {
-  token = null;
+  tokens.clear();
 }
